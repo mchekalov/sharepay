@@ -24,10 +24,21 @@ const DEFAULT_BASE_URL: &str = "http://localhost:3000";
 /// land on the right directory (e.g. some Linux distros' packaging).
 const TESSDATA_PREFIX_ENV_VAR: &str = "SHAREPAY_TESSDATA_PREFIX";
 
-/// OCR language (spec §1.8 recommends starting with Tesseract's "fast"
-/// trained-data variant for latency; `eng` is the only language this app
-/// supports for v1).
-const OCR_LANGUAGE: &str = "eng";
+/// OCR language(s), as a `+`-joined Tesseract language string (spec §1.8
+/// recommends starting with Tesseract's "fast" trained-data variant for
+/// latency). Started as `eng`-only for v1; extended to also cover Russian
+/// and Kazakh after validating against real Kazakhstani retail/restaurant
+/// receipts, which are commonly bilingual RU/KZ Cyrillic (e.g. `ЖИЫНЫ /
+/// ИТОГ`, `БАРЛЫҒЫ/ИТОГО`). Requires `rus.traineddata`/`kaz.traineddata`
+/// alongside `eng.traineddata` at the resolved tessdata path (see
+/// [`TESSDATA_PREFIX_ENV_VAR`]) — on this dev machine, installed via
+/// `brew install tesseract-lang`. Combined multi-language recognition costs
+/// measurably more CPU time than `eng`-only (see the module-level
+/// benchmark note near [`sharepay::receipt::TesseractEngine`]'s call site
+/// in `ocr_engine.rs`), but stayed well within an acceptable per-photo
+/// budget on this dev machine, so no fallback/single-language retry path
+/// was added.
+const OCR_LANGUAGE: &str = "rus+kaz+eng";
 
 #[tokio::main]
 async fn main() {

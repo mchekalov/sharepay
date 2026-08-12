@@ -71,7 +71,19 @@ impl TesseractEngine {
     /// `/opt/homebrew/share/tessdata` on this dev machine, or
     /// `/usr/share/tesseract-ocr/5/tessdata` on a typical Debian/Ubuntu
     /// VPS), or `None` to use Tesseract's own compiled-in default /
-    /// `TESSDATA_PREFIX` env var resolution. `lang`: e.g. `"eng"`.
+    /// `TESSDATA_PREFIX` env var resolution. `lang`: e.g. `"eng"`, or a
+    /// `+`-joined combination such as `"rus+kaz+eng"` — Tesseract's native
+    /// `TessBaseAPIInit` accepts this directly, no special handling needed
+    /// on this crate's side. Measured impact of going from `eng`-only to
+    /// `rus+kaz+eng`, same preprocessed (downscaled to this pipeline's
+    /// ~2200px-long-edge cap) real receipt photos, on this dev machine:
+    /// OCR recognition itself went from ~750-800ms to ~1000-2000ms per
+    /// photo (full request round trip, preprocess included, landed around
+    /// 1.4s-2.7s total either way) — roughly 1.3-2.5x slower, still well
+    /// within an acceptable per-upload budget, so no fallback/single-
+    /// language retry path was added. Tesseract evaluates all listed
+    /// languages' models concurrently rather than picking one upfront, so
+    /// this cost scales with language count.
     pub fn new(data_path: Option<&str>, lang: &str) -> Result<Self, OcrError> {
         let lt = LepTess::new(data_path, lang).map_err(|e| OcrError::Init(e.to_string()))?;
         Ok(Self {

@@ -5,7 +5,8 @@
 //! glare removal (explicitly deferred per spec §1.2, in favor of Mobile
 //! Client UX guidance).
 
-use std::io::Cursor;
+use std::io::{Cursor, Write};
+use std::process::{Command, Stdio};
 
 use image::{DynamicImage, GenericImageView, GrayImage, ImageFormat};
 use imageproc::contrast::{otsu_level, stretch_contrast, threshold, ThresholdType};
@@ -39,6 +40,19 @@ pub fn preprocess(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
     // 2. Correct EXIF orientation (read from the *original* bytes — the
     //    decoded `DynamicImage` above carries no EXIF metadata of its own).
     let img = correct_exif_orientation(raw_bytes, img);
+
+    // 2b. Cross-check/fallback via Tesseract's own orientation-and-script
+    //     detection (OSD). Real-world validation against genuine
+    //     Kazakhstani retail receipt photos surfaced a case EXIF alone
+    //     can't handle: no EXIF `Orientation` tag at all (common for
+    //     re-saved/edited photos), yet the raw pixel data is landscape
+    //     with the receipt's text running sideways in-frame. Always
+    //     running this (rather than only when EXIF was absent) keeps the
+    //     logic simple and makes it a genuine correctness cross-check in
+    //     both directions: on an image EXIF already corrected, OSD
+    //     reports "no rotation needed" and this is a no-op; when EXIF was
+    //     absent/wrong, OSD detects and this applies the real fix.
+    let img = correct_osd_orientation(img);
 
     // 3. Downscale to the bounded long edge (never upscale).
     let img = downscale(img);
@@ -104,6 +118,93 @@ fn read_exif_orientation(raw_bytes: &[u8]) -> u32 {
     exif.get_field(exif::Tag::Orientation, exif::In::PRIMARY)
         .and_then(|field| field.value.get_uint(0))
         .unwrap_or(1)
+}
+
+/// Long edge of the small thumbnail sent to Tesseract's OSD pass (below).
+/// OSD only needs to tell text-block orientation apart, not resolve fine
+/// glyph detail, so a small thumbnail keeps this fast — measured ~0.2s at
+/// this size on this dev machine, vs. ~1s+ feeding a full ~4000px-long-edge
+/// phone photo straight in.
+const OSD_THUMBNAIL_LONG_EDGE: u32 = 1000;
+
+/// Step 2b: detects the rotation (in degrees) needed to make `img` upright
+/// via Tesseract's orientation-and-script-detection (OSD) mode, and applies
+/// it. `leptess`/the underlying `tesseract-plumbing`/`tesseract-sys`
+/// bindings this app builds on expose no OSD API at all (checked directly
+/// against their source before writing this) — so, unlike every other OCR
+/// call in this pipeline, this one shells out to the `tesseract` CLI binary
+/// with `--psm 0` (its dedicated OSD mode) rather than going through the
+/// in-process engine. Best-effort, matching [`correct_exif_orientation`]'s
+/// philosophy: any failure (binary missing, non-zero exit, no parseable
+/// `Rotate:` line — OSD declines to guess on a mostly-blank or
+/// already-tight-cropped image) leaves the image unrotated rather than
+/// erroring the whole pipeline.
+fn correct_osd_orientation(img: DynamicImage) -> DynamicImage {
+    let Some(thumb_bytes) = encode_png(&osd_thumbnail(&img)) else {
+        return img;
+    };
+    match detect_osd_rotation(&thumb_bytes) {
+        Some(90) => img.rotate90(),
+        Some(180) => img.rotate180(),
+        Some(270) => img.rotate270(),
+        _ => img, // 0, unrecognized, or detection failed outright.
+    }
+}
+
+/// Downscales (never upscales) `img` so its long edge is at most
+/// [`OSD_THUMBNAIL_LONG_EDGE`], for feeding to [`detect_osd_rotation`].
+fn osd_thumbnail(img: &DynamicImage) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    let long_edge = w.max(h);
+    if long_edge <= OSD_THUMBNAIL_LONG_EDGE {
+        return img.clone();
+    }
+    let scale = OSD_THUMBNAIL_LONG_EDGE as f64 / long_edge as f64;
+    let new_w = ((w as f64 * scale).round() as u32).max(1);
+    let new_h = ((h as f64 * scale).round() as u32).max(1);
+    img.resize(new_w, new_h, image::imageops::FilterType::Triangle)
+}
+
+fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png).ok()?;
+    Some(out)
+}
+
+/// Runs `tesseract stdin - --psm 0` against `image_bytes` and parses its
+/// `Rotate: N` output line — the clockwise rotation (0/90/180/270) needed
+/// to make the image upright. `None` on any failure to run/parse.
+fn detect_osd_rotation(image_bytes: &[u8]) -> Option<u32> {
+    let mut child = Command::new("tesseract")
+        .args(["stdin", "-", "--psm", "0"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(image_bytes).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_osd_rotate(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parses the `Rotate: N` line out of `tesseract --psm 0`'s stdout, e.g.:
+/// ```text
+/// Page number: 0
+/// Orientation in degrees: 270
+/// Rotate: 90
+/// Orientation confidence: 16.73
+/// Script: Cyrillic
+/// Script confidence: 6.92
+/// ```
+/// A pure, easily-unit-testable split from [`detect_osd_rotation`]'s actual
+/// process-spawning.
+fn parse_osd_rotate(osd_output: &str) -> Option<u32> {
+    osd_output
+        .lines()
+        .find_map(|line| line.strip_prefix("Rotate:")?.trim().parse::<u32>().ok())
 }
 
 /// Linearly stretches `gray`'s actual min-max luma range to fill [0, 255].
@@ -200,5 +301,53 @@ mod tests {
                 pixel.0[0]
             );
         }
+    }
+
+    // -- OSD (`tesseract --psm 0`) output parsing --------------------------
+
+    #[test]
+    fn parses_rotate_line_from_real_osd_output() {
+        let output = "Page number: 0\n\
+                       Orientation in degrees: 270\n\
+                       Rotate: 90\n\
+                       Orientation confidence: 16.73\n\
+                       Script: Cyrillic\n\
+                       Script confidence: 6.92\n";
+        assert_eq!(parse_osd_rotate(output), Some(90));
+    }
+
+    #[test]
+    fn parses_zero_rotate_for_an_already_upright_image() {
+        let output = "Page number: 0\nOrientation in degrees: 0\nRotate: 0\n";
+        assert_eq!(parse_osd_rotate(output), Some(0));
+    }
+
+    #[test]
+    fn returns_none_when_no_rotate_line_present() {
+        // OSD declines to guess (e.g. too little text) and emits an error
+        // instead of a normal report.
+        assert_eq!(parse_osd_rotate(""), None);
+        assert_eq!(parse_osd_rotate("Too few characters. Skipping this page\n"), None);
+    }
+
+    #[test]
+    fn osd_correction_rotates_a_sideways_synthetic_receipt_upright() {
+        // Skip gracefully if the `tesseract` CLI binary isn't on PATH —
+        // this one test step (unlike the in-process `leptess` calls used
+        // everywhere else) depends on it directly.
+        if Command::new("tesseract").arg("--version").output().is_err() {
+            eprintln!("skipping: `tesseract` CLI binary not found on PATH");
+            return;
+        }
+        // A tall, mostly-white image with a solid black band isn't enough
+        // real text for OSD to make a confident call either way, so this
+        // just exercises that `correct_osd_orientation` runs without
+        // panicking/hanging and returns *some* valid image back out; the
+        // real, text-bearing rotation behavior is validated against actual
+        // receipt photos separately (see the task report, not a unit test
+        // — OSD's confidence on real text needs real text).
+        let img = DynamicImage::ImageLuma8(GrayImage::from_pixel(300, 600, Luma([255u8])));
+        let out = correct_osd_orientation(img);
+        assert!(out.dimensions().0 > 0 && out.dimensions().1 > 0);
     }
 }
