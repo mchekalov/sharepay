@@ -10,12 +10,12 @@
 //!   `host_token_hash` and just persists them; on a (vanishingly rare)
 //!   collision it returns [`PriceDistributorError::IdCollision`] and the
 //!   caller is expected to regenerate and retry (spec §2.1).
-//! - `participant_id` here is the DB's `INTEGER PRIMARY KEY AUTOINCREMENT`
-//!   surrogate key, *not* the unguessable 128-bit participant token
-//!   described in spec §2.4. If the QR/Session component wants that
-//!   external-facing token to be unlinkable from the internal integer id,
-//!   it should maintain its own mapping/cookie value and pass the integer
-//!   id through when calling these functions.
+//! - `participant_id` is a caller-generated unguessable 128-bit token
+//!   (spec §2.4), the same style as `bill_id`/`host_token` — *not* a
+//!   DB-assigned surrogate key. [`join_bill`] takes an already-generated
+//!   `participant_id` and just persists it, same convention as
+//!   [`create_bill`]. Token generation lives in the QR/Session component
+//!   (`src/bill/token.rs`).
 //! - Every mutation re-validates bill/item/participant ownership and bill
 //!   status itself (defense against stale/tampered form fields, and so the
 //!   invariants hold even if a route handler forgets to check first).
@@ -23,12 +23,32 @@
 //!   `query!`/`query_as!` macros, so `cargo build` doesn't require a live
 //!   database or a committed `.sqlx` offline-query cache. Revisit if the
 //!   project adopts `cargo sqlx prepare` later.
+//! - Bill status lifecycle (spec §2.5): `draft`, `pending_ocr`,
+//!   `awaiting_photo_retry`, and `pending_confirmation` are all "pre-open"
+//!   states — items may be added/edited in any of them (this is when OCR
+//!   parses items and the host reviews/edits them). Items lock once the
+//!   bill reaches `open` or `closed`. [`PRE_OPEN_STATUSES`] is the
+//!   authoritative list.
 
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
 use crate::pricing::split::{compute_split, ItemInput, MarkerInput};
 use crate::pricing::PriceDistributorError as Error;
+
+/// Bill statuses in which the item list is still mutable (spec §2.5 /
+/// §2.5's "Items frozen once open" rule). Anything not in this list is
+/// either `open` or `closed`, where items are locked, or `expired`.
+pub const PRE_OPEN_STATUSES: &[&str] = &[
+    "draft",
+    "pending_ocr",
+    "awaiting_photo_retry",
+    "pending_confirmation",
+];
+
+fn is_pre_open(status: &str) -> bool {
+    PRE_OPEN_STATUSES.contains(&status)
+}
 
 /// Input row for [`add_items`].
 #[derive(Debug, Clone)]
@@ -40,7 +60,7 @@ pub struct NewItem {
 /// One participant's mark on an item, as returned in [`BillState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkerView {
-    pub participant_id: i64,
+    pub participant_id: String,
     pub display_name: String,
 }
 
@@ -65,7 +85,7 @@ pub struct ItemView {
 /// One participant's computed totals, as returned in [`BillState`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParticipantView {
-    pub id: i64,
+    pub id: String,
     pub display_name: String,
     pub dish_subtotal: i64,
     pub tax_tip_share: i64,
@@ -116,9 +136,12 @@ pub async fn create_bill(
 }
 
 /// Adds items to a bill. Host-only (auth enforced by the caller), permitted
-/// only while `status = 'draft'` (spec §3.6). Returns the new items' ids in
-/// the same order as `items`. Items are appended after any existing rows
-/// (`sort_order` continues from the current count).
+/// while the bill is in any pre-open status ([`PRE_OPEN_STATUSES`]: `draft`,
+/// `pending_ocr`, `awaiting_photo_retry`, `pending_confirmation`) — this is
+/// when OCR parses items and the host reviews/edits them (spec §2.5).
+/// Returns the new items' ids in the same order as `items`. Items are
+/// appended after any existing rows (`sort_order` continues from the
+/// current count).
 pub async fn add_items(
     pool: &SqlitePool,
     bill_id: &str,
@@ -131,7 +154,7 @@ pub async fn add_items(
         .fetch_optional(&mut *tx)
         .await?;
     let status = status.ok_or(Error::NotFound)?;
-    if status != "draft" {
+    if !is_pre_open(&status) {
         return Err(Error::BillAlreadyOpen);
     }
 
@@ -160,11 +183,15 @@ pub async fn add_items(
     Ok(ids)
 }
 
-/// `draft -> open`. Sets `opened_at`; items lock from this point onward
-/// (spec §3.6, enforced both here at the status gate and by the DB
-/// triggers in `migrations/0001_init.sql`). Idempotent: calling this on an
-/// already-`open` bill is a no-op success (spec §2.7's idempotent-
-/// transition guidance).
+/// Any pre-open status -> `open` (spec §2.5: the real-world transition is
+/// `pending_confirmation -> open` once the host confirms items, but this
+/// function accepts any pre-open status as a defensive measure — the
+/// bill/session state machine that decides *when* it's valid to call this
+/// is owned by the QR/Session component). Sets `opened_at`; items lock from
+/// this point onward (spec §3.6, enforced both here at the status gate and
+/// by the DB triggers in `migrations/0001_init.sql`). Idempotent: calling
+/// this on an already-`open` bill is a no-op success (spec §2.7's
+/// idempotent-transition guidance).
 pub async fn open_bill(pool: &SqlitePool, bill_id: &str) -> Result<(), Error> {
     let status: Option<String> = sqlx::query_scalar("SELECT status FROM bills WHERE id = ?")
         .bind(bill_id)
@@ -172,31 +199,39 @@ pub async fn open_bill(pool: &SqlitePool, bill_id: &str) -> Result<(), Error> {
         .await?;
     let status = status.ok_or(Error::NotFound)?;
 
-    match status.as_str() {
-        "draft" => {
-            sqlx::query(
-                "UPDATE bills SET status = 'open', opened_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                 WHERE id = ?",
-            )
-            .bind(bill_id)
-            .execute(pool)
-            .await?;
-            Ok(())
-        }
-        "open" => Ok(()), // idempotent double-tap
-        "closed" => Err(Error::BillClosed),
-        other => unreachable!("unknown bill status {other:?}"),
+    if status == "open" {
+        return Ok(()); // idempotent double-tap
     }
+    if status == "closed" {
+        return Err(Error::BillClosed);
+    }
+    if is_pre_open(&status) {
+        sqlx::query(
+            "UPDATE bills SET status = 'open', opened_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE id = ?",
+        )
+        .bind(bill_id)
+        .execute(pool)
+        .await?;
+        return Ok(());
+    }
+    unreachable!("unknown bill status {status:?}")
 }
 
-/// Creates a participant on an `open` bill. Returns `Err(NameTaken)` on a
-/// case-insensitive display-name collision within the bill (the DB's
-/// `UNIQUE (bill_id, display_name_normalized)` constraint, spec §3.2).
+/// Creates a participant on an `open` bill. `participant_id` is an
+/// already-generated unguessable 128-bit token (spec §2.4), same convention
+/// as [`create_bill`]'s `bill_id` parameter — generation is owned by the
+/// QR/Session component. Returns `Err(NameTaken)` on a case-insensitive
+/// display-name collision within the bill (the DB's
+/// `UNIQUE (bill_id, display_name_normalized)` constraint, spec §3.2), or
+/// `Err(IdCollision)` in the vanishingly rare case `participant_id` itself
+/// collides.
 pub async fn join_bill(
     pool: &SqlitePool,
     bill_id: &str,
+    participant_id: &str,
     display_name: &str,
-) -> Result<i64, Error> {
+) -> Result<String, Error> {
     let trimmed = display_name.trim();
     if trimmed.is_empty() || trimmed.chars().count() > MAX_DISPLAY_NAME_LEN {
         return Err(Error::InvalidDisplayName);
@@ -207,25 +242,35 @@ pub async fn join_bill(
         .fetch_optional(pool)
         .await?;
     let status = status.ok_or(Error::NotFound)?;
-    match status.as_str() {
-        "draft" => return Err(Error::BillNotOpen),
-        "closed" => return Err(Error::BillClosed),
-        "open" => {}
-        other => unreachable!("unknown bill status {other:?}"),
+    if status == "closed" {
+        return Err(Error::BillClosed);
+    }
+    if status != "open" {
+        return Err(Error::BillNotOpen);
     }
 
-    let result = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO participants (bill_id, display_name) VALUES (?, ?) RETURNING id",
+    let result = sqlx::query(
+        "INSERT INTO participants (id, bill_id, display_name) VALUES (?, ?, ?)",
     )
+    .bind(participant_id)
     .bind(bill_id)
     .bind(trimmed)
-    .fetch_one(pool)
+    .execute(pool)
     .await;
 
     match result {
-        Ok(id) => Ok(id),
+        Ok(_) => Ok(participant_id.to_string()),
         Err(sqlx::Error::Database(db_err)) if db_err.is_unique_violation() => {
-            Err(Error::NameTaken)
+            // Distinguish which UNIQUE constraint fired: the primary key
+            // (participant_id collision, vanishingly rare) vs. the
+            // per-bill case-insensitive display-name constraint (the
+            // common case). SQLite's error message names the column.
+            let message = db_err.message();
+            if message.contains("participants.id") {
+                Err(Error::IdCollision)
+            } else {
+                Err(Error::NameTaken)
+            }
         }
         Err(e) => Err(Error::from(e)),
     }
@@ -237,18 +282,18 @@ async fn validate_open_bill_item_participant(
     pool: &SqlitePool,
     bill_id: &str,
     item_id: i64,
-    participant_id: i64,
+    participant_id: &str,
 ) -> Result<(), Error> {
     let status: Option<String> = sqlx::query_scalar("SELECT status FROM bills WHERE id = ?")
         .bind(bill_id)
         .fetch_optional(pool)
         .await?;
     let status = status.ok_or(Error::NotFound)?;
-    match status.as_str() {
-        "draft" => return Err(Error::BillNotOpen),
-        "closed" => return Err(Error::BillClosed),
-        "open" => {}
-        other => unreachable!("unknown bill status {other:?}"),
+    if status == "closed" {
+        return Err(Error::BillClosed);
+    }
+    if status != "open" {
+        return Err(Error::BillNotOpen);
     }
 
     let item_ok: Option<i64> = sqlx::query_scalar("SELECT 1 FROM items WHERE id = ? AND bill_id = ?")
@@ -279,7 +324,7 @@ pub async fn mark_item(
     pool: &SqlitePool,
     bill_id: &str,
     item_id: i64,
-    participant_id: i64,
+    participant_id: &str,
 ) -> Result<(), Error> {
     validate_open_bill_item_participant(pool, bill_id, item_id, participant_id).await?;
 
@@ -296,7 +341,7 @@ pub async fn unmark_item(
     pool: &SqlitePool,
     bill_id: &str,
     item_id: i64,
-    participant_id: i64,
+    participant_id: &str,
 ) -> Result<(), Error> {
     validate_open_bill_item_participant(pool, bill_id, item_id, participant_id).await?;
 
@@ -352,7 +397,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ItemRow {
 
 struct MarkerRow {
     item_id: i64,
-    participant_id: i64,
+    participant_id: String,
     display_name: String,
     marked_at: String,
 }
@@ -369,7 +414,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for MarkerRow {
 }
 
 struct ParticipantRow {
-    id: i64,
+    id: String,
     display_name: String,
 }
 
@@ -389,7 +434,7 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for ParticipantRow {
 pub async fn get_bill_state(
     pool: &SqlitePool,
     bill_id: &str,
-    requesting_participant_id: Option<i64>,
+    requesting_participant_id: Option<&str>,
 ) -> Result<BillState, Error> {
     let bill_row: Option<(String, Option<i64>, i64)> = sqlx::query_as(
         "SELECT status, receipt_total, tax_tip_amount FROM bills WHERE id = ?",
@@ -433,7 +478,7 @@ pub async fn get_bill_state(
                 .iter()
                 .filter(|m| m.item_id == item.id)
                 .map(|m| MarkerInput {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
                     marked_at: m.marked_at.clone(),
                 })
                 .collect();
@@ -454,7 +499,7 @@ pub async fn get_bill_state(
                 .iter()
                 .filter(|m| m.item_id == item.id)
                 .map(|m| MarkerView {
-                    participant_id: m.participant_id,
+                    participant_id: m.participant_id.clone(),
                     display_name: m.display_name.clone(),
                 })
                 .collect();
@@ -483,7 +528,7 @@ pub async fn get_bill_state(
         .map(|p| {
             let split_entry = split.participants.get(&p.id).copied().unwrap_or_default();
             ParticipantView {
-                id: p.id,
+                id: p.id.clone(),
                 display_name: p.display_name.clone(),
                 dish_subtotal: split_entry.dish_subtotal,
                 tax_tip_share: split_entry.tax_tip_share,
@@ -569,12 +614,19 @@ mod tests {
         // Idempotent double-open.
         open_bill(&pool, &bill_id).await.unwrap();
 
-        let alice = join_bill(&pool, &bill_id, "Alice").await.unwrap();
-        let bob = join_bill(&pool, &bill_id, "Bob").await.unwrap();
-        let carol = join_bill(&pool, &bill_id, "Carol").await.unwrap();
+        let alice = join_bill(&pool, &bill_id, "participant-alice", "Alice")
+            .await
+            .unwrap();
+        let bob = join_bill(&pool, &bill_id, "participant-bob", "Bob")
+            .await
+            .unwrap();
+        let carol = join_bill(&pool, &bill_id, "participant-carol", "Carol")
+            .await
+            .unwrap();
 
-        // Case-insensitive duplicate name rejected.
-        let dup = join_bill(&pool, &bill_id, "  alice ").await;
+        // Case-insensitive duplicate name rejected (even with a distinct
+        // participant_id token).
+        let dup = join_bill(&pool, &bill_id, "participant-alice-2", "  alice ").await;
         assert!(matches!(dup, Err(PriceDistributorError::NameTaken)));
 
         // Items are locked once open.
@@ -592,16 +644,16 @@ mod tests {
             Err(PriceDistributorError::BillAlreadyOpen)
         ));
 
-        mark_item(&pool, &bill_id, burger_id, alice).await.unwrap();
-        mark_item(&pool, &bill_id, burger_id, bob).await.unwrap();
-        mark_item(&pool, &bill_id, burger_id, carol).await.unwrap();
-        mark_item(&pool, &bill_id, fries_id, alice).await.unwrap();
-        mark_item(&pool, &bill_id, fries_id, bob).await.unwrap();
+        mark_item(&pool, &bill_id, burger_id, &alice).await.unwrap();
+        mark_item(&pool, &bill_id, burger_id, &bob).await.unwrap();
+        mark_item(&pool, &bill_id, burger_id, &carol).await.unwrap();
+        mark_item(&pool, &bill_id, fries_id, &alice).await.unwrap();
+        mark_item(&pool, &bill_id, fries_id, &bob).await.unwrap();
         // Double-mark is idempotent (INSERT OR IGNORE).
-        mark_item(&pool, &bill_id, fries_id, bob).await.unwrap();
+        mark_item(&pool, &bill_id, fries_id, &bob).await.unwrap();
         // Salad is left unmarked -> unassigned.
 
-        let state = get_bill_state(&pool, &bill_id, Some(alice)).await.unwrap();
+        let state = get_bill_state(&pool, &bill_id, Some(&alice)).await.unwrap();
         assert_eq!(state.status, "open");
         assert_eq!(state.assigned_total, 1700);
         assert_eq!(state.unassigned_amount, 900);
@@ -626,7 +678,7 @@ mod tests {
         assert_eq!(burger_view.per_marker_share, Some(400));
 
         // Unmark and re-check.
-        unmark_item(&pool, &bill_id, burger_id, carol).await.unwrap();
+        unmark_item(&pool, &bill_id, burger_id, &carol).await.unwrap();
         let state2 = get_bill_state(&pool, &bill_id, None).await.unwrap();
         assert_eq!(state2.my_total, 0, "no requesting participant this time");
         let burger_view2 = state2.items.iter().find(|i| i.id == burger_id).unwrap();
@@ -640,14 +692,14 @@ mod tests {
         assert_eq!(closed_state.status, "closed");
 
         // Marking after close is rejected.
-        let mark_after_close = mark_item(&pool, &bill_id, fries_id, alice).await;
+        let mark_after_close = mark_item(&pool, &bill_id, fries_id, &alice).await;
         assert!(matches!(
             mark_after_close,
             Err(PriceDistributorError::BillClosed)
         ));
 
         // Joining after close is also rejected.
-        let join_after_close = join_bill(&pool, &bill_id, "Dave").await;
+        let join_after_close = join_bill(&pool, &bill_id, "participant-dave", "Dave").await;
         assert!(matches!(
             join_after_close,
             Err(PriceDistributorError::BillClosed)
@@ -683,10 +735,12 @@ mod tests {
         open_bill(&pool, &bill_a).await.unwrap();
         open_bill(&pool, &bill_b).await.unwrap();
 
-        let participant_b = join_bill(&pool, &bill_b, "Eve").await.unwrap();
+        let participant_b = join_bill(&pool, &bill_b, "participant-eve", "Eve")
+            .await
+            .unwrap();
 
         // participant_b belongs to bill_b, not bill_a — must be rejected.
-        let result = mark_item(&pool, &bill_a, item_a, participant_b).await;
+        let result = mark_item(&pool, &bill_a, item_a, &participant_b).await;
         assert!(matches!(result, Err(PriceDistributorError::NotFound)));
     }
 
@@ -696,10 +750,57 @@ mod tests {
         let bill_id = create_bill(&pool, "bill-empty-name", "hash").await.unwrap();
         open_bill(&pool, &bill_id).await.unwrap();
 
-        let result = join_bill(&pool, &bill_id, "   ").await;
+        let result = join_bill(&pool, &bill_id, "participant-empty", "   ").await;
         assert!(matches!(
             result,
             Err(PriceDistributorError::InvalidDisplayName)
         ));
+    }
+
+    /// Items remain addable/editable through every pre-open state (spec
+    /// §2.5), locking only once the bill is `open`.
+    #[tokio::test]
+    async fn items_addable_in_every_pre_open_state_locked_once_open() {
+        let pool = test_pool().await;
+
+        for status in super::PRE_OPEN_STATUSES {
+            let bill_id = format!("bill-status-{status}");
+            create_bill(&pool, &bill_id, "hash").await.unwrap();
+            sqlx::query("UPDATE bills SET status = ? WHERE id = ?")
+                .bind(*status)
+                .bind(&bill_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let result = add_items(
+                &pool,
+                &bill_id,
+                vec![NewItem {
+                    name: "Item".into(),
+                    price_cents: 100,
+                }],
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "expected add_items to succeed while status = {status}"
+            );
+        }
+
+        let bill_id = create_bill(&pool, "bill-open-locks-items", "hash")
+            .await
+            .unwrap();
+        open_bill(&pool, &bill_id).await.unwrap();
+        let result = add_items(
+            &pool,
+            &bill_id,
+            vec![NewItem {
+                name: "Too late".into(),
+                price_cents: 100,
+            }],
+        )
+        .await;
+        assert!(matches!(result, Err(PriceDistributorError::BillAlreadyOpen)));
     }
 }

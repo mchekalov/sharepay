@@ -1,9 +1,15 @@
+use sharepay::cleanup;
 use sharepay::db::{self, DbConfig};
+use sharepay::routes::{router, AppState};
 
-/// Minimal entry point: construct the pool (running migrations on
-/// startup), and start an axum server with no routes yet. The HTTP surface
-/// (QR/Session management, receipt upload, mobile client fragments) is
-/// owned by other components and wired in on top of this.
+/// Environment variable naming the public base URL used to build join
+/// links / QR payloads (e.g. `https://sharepay.example`). Falls back to a
+/// localhost default suitable for local development only — production
+/// deployments must set this to the real HTTPS domain (spec §2.1's join
+/// URL shape and §2.3's `Secure` cookie both assume HTTPS in production).
+const BASE_URL_ENV_VAR: &str = "SHAREPAY_BASE_URL";
+const DEFAULT_BASE_URL: &str = "http://localhost:3000";
+
 #[tokio::main]
 async fn main() {
     let config = DbConfig::from_env();
@@ -12,11 +18,15 @@ async fn main() {
         .await
         .expect("failed to initialize database pool / run migrations");
 
-    // Keep the pool alive for the process lifetime; future components will
-    // thread it through as axum `State`.
-    let _pool = pool;
+    // Retention sweep (spec §2.6): re-spawned on every process start, not
+    // relied upon to survive a restart.
+    cleanup::spawn(pool.clone());
 
-    let app = axum::Router::new();
+    let base_url =
+        std::env::var(BASE_URL_ENV_VAR).unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+    let state = AppState { pool, base_url };
+
+    let app = router(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await

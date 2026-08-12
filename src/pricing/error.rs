@@ -15,8 +15,9 @@ pub enum PriceDistributorError {
     #[error("that name is already taken on this bill")]
     NameTaken,
 
-    /// A `draft`-only operation (e.g. `add_items`, `open_bill`) was
-    /// attempted on a bill that is no longer `draft`.
+    /// A pre-open-only operation (e.g. `add_items`) was attempted on a bill
+    /// that has already reached `open` or `closed` — items are locked once
+    /// a bill leaves the pre-open states (spec §2.5).
     #[error("bill is already open (or closed) — items are locked")]
     BillAlreadyOpen,
 

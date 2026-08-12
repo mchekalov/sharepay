@@ -5,10 +5,19 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+base64 = "0.23.1"
+sha2 = "0.11.0"
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+getrandom = "0.4.3"
+time = "0.3.55"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "test-util"] }
+http-body-util = "0.1.4"
+serde_json = "1.0.151"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "test-util"] }
+tower = { version = "0.5.3", features = ["util"] }

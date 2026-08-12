@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 /// "Step A").
 #[derive(Debug, Clone)]
 pub struct MarkerInput {
-    pub participant_id: i64,
+    /// Unguessable 128-bit participant token (spec §2.4), not a sequential
+    /// integer — see `src/pricing/api.rs` module docs.
+    pub participant_id: String,
     /// ISO-8601 timestamp string (as stored — `strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`).
     /// Lexicographic string ordering is correct for this format.
     pub marked_at: String,
@@ -42,10 +44,10 @@ pub struct ParticipantSplit {
 pub struct SplitResult {
     /// `item_id -> (participant_id -> share cents)`. Items with zero
     /// markers appear with an empty inner map.
-    pub per_item_shares: BTreeMap<i64, BTreeMap<i64, i64>>,
+    pub per_item_shares: BTreeMap<i64, BTreeMap<String, i64>>,
     /// `participant_id -> split totals`, for participants who marked at
     /// least one item.
-    pub participants: BTreeMap<i64, ParticipantSplit>,
+    pub participants: BTreeMap<String, ParticipantSplit>,
     /// Sum of prices of items with `marker_count > 0`.
     pub assigned_total: i64,
     /// Sum of prices of items with zero markers, plus the entire
@@ -61,8 +63,8 @@ pub struct SplitResult {
 /// Invariant (verified in tests below): `sum(participant totals) +
 /// unassigned_amount == sum(item prices) + tax_tip_amount`, exactly.
 pub fn compute_split(items: &[ItemInput], tax_tip_amount: i64) -> SplitResult {
-    let mut per_item_shares: BTreeMap<i64, BTreeMap<i64, i64>> = BTreeMap::new();
-    let mut dish_subtotal: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut per_item_shares: BTreeMap<i64, BTreeMap<String, i64>> = BTreeMap::new();
+    let mut dish_subtotal: BTreeMap<String, i64> = BTreeMap::new();
     let mut assigned_total: i64 = 0;
     let mut unassigned_amount: i64 = 0;
 
@@ -91,18 +93,18 @@ pub fn compute_split(items: &[ItemInput], tax_tip_amount: i64) -> SplitResult {
         let mut shares = BTreeMap::new();
         for (i, marker) in ordered.iter().enumerate() {
             let share = base + if (i as i64) < remainder { 1 } else { 0 };
-            shares.insert(marker.participant_id, share);
-            *dish_subtotal.entry(marker.participant_id).or_insert(0) += share;
+            shares.insert(marker.participant_id.clone(), share);
+            *dish_subtotal.entry(marker.participant_id.clone()).or_insert(0) += share;
         }
         per_item_shares.insert(item.item_id, shares);
     }
 
     // --- Step B: tax/tip proportional distribution ---
-    let mut participants: BTreeMap<i64, ParticipantSplit> = dish_subtotal
+    let mut participants: BTreeMap<String, ParticipantSplit> = dish_subtotal
         .iter()
-        .map(|(&pid, &subtotal)| {
+        .map(|(pid, &subtotal)| {
             (
-                pid,
+                pid.clone(),
                 ParticipantSplit {
                     dish_subtotal: subtotal,
                     tax_tip_share: 0,
@@ -121,7 +123,7 @@ pub fn compute_split(items: &[ItemInput], tax_tip_amount: i64) -> SplitResult {
         // common denominator of `assigned_total`. Comparing remainders
         // directly (same denominator) avoids floating point entirely.
         struct Candidate {
-            participant_id: i64,
+            participant_id: String,
             base: i64,
             remainder_numerator: i64,
         }
@@ -129,12 +131,12 @@ pub fn compute_split(items: &[ItemInput], tax_tip_amount: i64) -> SplitResult {
         let mut candidates: Vec<Candidate> = dish_subtotal
             .iter()
             .filter(|&(_, &subtotal)| subtotal > 0)
-            .map(|(&pid, &subtotal)| {
+            .map(|(pid, &subtotal)| {
                 let numerator = subtotal * tax_tip_amount;
                 let base = numerator / assigned_total;
                 let remainder_numerator = numerator - base * assigned_total;
                 Candidate {
-                    participant_id: pid,
+                    participant_id: pid.clone(),
                     base,
                     remainder_numerator,
                 }
@@ -185,10 +187,11 @@ mod tests {
     /// Expected: Alice $8.38, Bob $8.37, Carol $5.15, unassigned $9.00.
     #[test]
     fn worked_example_from_spec() {
-        // participant_id ordering: Alice=1, Bob=2, Carol=3 (join order).
-        let alice = 1;
-        let bob = 2;
-        let carol = 3;
+        // participant_id ordering: Alice, Bob, Carol (join order); string
+        // tokens rather than sequential integers (spec §2.4).
+        let alice = "alice".to_string();
+        let bob = "bob".to_string();
+        let carol = "carol".to_string();
 
         let items = vec![
             ItemInput {
@@ -196,15 +199,15 @@ mod tests {
                 price_cents: 1200,
                 markers: vec![
                     MarkerInput {
-                        participant_id: alice,
+                        participant_id: alice.clone(),
                         marked_at: "2026-08-12T10:00:00.000Z".into(),
                     },
                     MarkerInput {
-                        participant_id: bob,
+                        participant_id: bob.clone(),
                         marked_at: "2026-08-12T10:00:01.000Z".into(),
                     },
                     MarkerInput {
-                        participant_id: carol,
+                        participant_id: carol.clone(),
                         marked_at: "2026-08-12T10:00:02.000Z".into(),
                     },
                 ],
@@ -214,11 +217,11 @@ mod tests {
                 price_cents: 500,
                 markers: vec![
                     MarkerInput {
-                        participant_id: alice,
+                        participant_id: alice.clone(),
                         marked_at: "2026-08-12T10:00:03.000Z".into(),
                     },
                     MarkerInput {
-                        participant_id: bob,
+                        participant_id: bob.clone(),
                         marked_at: "2026-08-12T10:00:04.000Z".into(),
                     },
                 ],
@@ -280,24 +283,24 @@ mod tests {
             price_cents: 100,
             markers: vec![
                 MarkerInput {
-                    participant_id: 3,
+                    participant_id: "p3".into(),
                     marked_at: "2026-08-12T10:00:02.000Z".into(),
                 },
                 MarkerInput {
-                    participant_id: 1,
+                    participant_id: "p1".into(),
                     marked_at: "2026-08-12T10:00:00.000Z".into(),
                 },
                 MarkerInput {
-                    participant_id: 2,
+                    participant_id: "p2".into(),
                     marked_at: "2026-08-12T10:00:01.000Z".into(),
                 },
             ],
         }];
         let result = compute_split(&items, 0);
         let shares = &result.per_item_shares[&1];
-        assert_eq!(shares[&1], 34); // earliest marker gets the extra cent
-        assert_eq!(shares[&2], 33);
-        assert_eq!(shares[&3], 33);
+        assert_eq!(shares["p1"], 34); // earliest marker gets the extra cent
+        assert_eq!(shares["p2"], 33);
+        assert_eq!(shares["p3"], 33);
         assert_eq!(shares.values().sum::<i64>(), 100);
     }
 
@@ -314,14 +317,14 @@ mod tests {
         ];
 
         for (item_specs, tax_tip_amount) in cases {
-            let mut next_participant_id = 1i64;
+            let mut next_participant_id = 1u32;
             let mut items = Vec::new();
             let mut receipt_total = tax_tip_amount;
             for (item_id, price_cents, marker_count) in item_specs {
                 receipt_total += price_cents;
                 let markers = (0..marker_count)
                     .map(|i| {
-                        let pid = next_participant_id;
+                        let pid = format!("p{next_participant_id}");
                         next_participant_id += 1;
                         MarkerInput {
                             participant_id: pid,
