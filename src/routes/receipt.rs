@@ -32,7 +32,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -477,5 +477,15 @@ async fn run_pipeline(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/b/{bill_id}/photo", post(upload_photo))
+        // axum's own default body-size limit (2 MB) sits in front of this
+        // handler's `MAX_UPLOAD_BYTES` check and applies first. Left at the
+        // default, any upload over 2 MB (i.e. most modern phone-camera
+        // photos) gets its request body truncated mid-stream, which then
+        // fails as an opaque multipart-parse error rather than the clean,
+        // informative 400 `MAX_UPLOAD_BYTES` is meant to produce. Raise the
+        // ceiling here so that check is actually the one that fires; a
+        // small margin above `MAX_UPLOAD_BYTES` accounts for multipart
+        // boundary/header framing overhead.
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES + 1024 * 1024))
         .with_state(state)
 }
