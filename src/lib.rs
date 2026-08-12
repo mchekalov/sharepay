@@ -11,4 +11,5 @@ pub mod db;
 pub mod host_auth;
 pub mod pricing;
 pub mod qr;
+pub mod receipt;
 pub mod routes;

@@ -40,20 +40,15 @@ pub async fn get_host_token_hash(
 }
 
 /// Directly sets a bill's status, bypassing `pricing::api`'s transition
-/// validation. Two legitimate uses, both documented at call sites:
-///
-/// 1. The stubbed `draft -> pending_ocr` transition in
-///    `POST /bills` (`src/routes/bill.rs`) — until the Receipt Recognizer
-///    component replaces it with the real OCR pipeline (which owns
-///    `pending_ocr -> awaiting_photo_retry` and
-///    `pending_ocr -> pending_confirmation`), nothing else drives a bill
-///    out of `pending_ocr`.
-/// 2. Test harnesses that need to drive a bill into a specific pre-open
-///    state to exercise `confirm`/`open`/`close` without a real OCR
-///    pipeline wired up yet.
-///
-/// Not reachable from any HTTP route directly (no route accepts an
-/// arbitrary target status from a client).
+/// validation. **Test-harness-only**: drives a bill into a specific
+/// pre-open state to exercise `confirm`/`open`/`close` logic without
+/// running the real Receipt Recognizer pipeline. Not reachable from any
+/// HTTP route directly (no route accepts an arbitrary target status from a
+/// client) — production status transitions go through the named,
+/// single-purpose functions below ([`mark_pending_ocr`],
+/// [`mark_awaiting_photo_retry`], [`mark_pending_confirmation`]) or
+/// `pricing::api::open_bill`/`close_bill`, each of which encodes exactly
+/// one real transition rather than accepting an arbitrary target status.
 pub async fn force_status(
     pool: &SqlitePool,
     bill_id: &str,
@@ -64,5 +59,63 @@ pub async fn force_status(
         .bind(bill_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Bill statuses from which `POST /b/{id}/photo` accepts an upload (spec
+/// §1.5/§2.5): the initial attempt (`pending_ocr`, entered immediately at
+/// bill creation) or a retry after a reconciliation mismatch
+/// (`awaiting_photo_retry`) — the same handler serves both.
+pub const PHOTO_UPLOAD_STATUSES: &[&str] = &["pending_ocr", "awaiting_photo_retry"];
+
+/// `draft -> pending_ocr`: the bill has been created and is now waiting for
+/// the host's first receipt photo (spec §2.1: "the Bill row is created as
+/// soon as the host starts the upload flow"). A real, single-purpose
+/// production transition (unlike [`force_status`]) — called once, directly
+/// after `pricing::api::create_bill`, by `POST /bills`.
+pub async fn mark_pending_ocr(pool: &SqlitePool, bill_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE bills SET status = 'pending_ocr' WHERE id = ?")
+        .bind(bill_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `pending_ocr`/`awaiting_photo_retry -> awaiting_photo_retry`: OCR ran
+/// but reconciliation hard-mismatched (spec §1.4/§1.6). The bill and its
+/// participants persist untouched — pre-open bills have no participants
+/// yet, and no receipt-derived rows are written on this path — the host
+/// simply retries the upload against the same `bill_id`.
+pub async fn mark_awaiting_photo_retry(pool: &SqlitePool, bill_id: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE bills SET status = 'awaiting_photo_retry' WHERE id = ?")
+        .bind(bill_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// `pending_ocr`/`awaiting_photo_retry -> pending_confirmation`: OCR and
+/// reconciliation succeeded. Persists the reconciled `receipt_total`/
+/// `tax_tip_amount` in the same statement as the status flip. Parsed item
+/// rows themselves are persisted separately via
+/// `pricing::api::add_items` (valid in every pre-open status, spec §2.5) —
+/// callers should add items before calling this, though the ordering
+/// doesn't affect correctness since `pending_confirmation` is itself
+/// pre-open.
+pub async fn mark_pending_confirmation(
+    pool: &SqlitePool,
+    bill_id: &str,
+    receipt_total_cents: i64,
+    tax_tip_amount_cents: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE bills SET status = 'pending_confirmation', receipt_total = ?, tax_tip_amount = ? \
+         WHERE id = ?",
+    )
+    .bind(receipt_total_cents)
+    .bind(tax_tip_amount_cents)
+    .bind(bill_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }

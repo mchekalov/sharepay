@@ -5,18 +5,16 @@
 //! (spec §4).
 //!
 //! ## What's stubbed / deferred here
-//! - `POST /bills` creates the bill in `draft` and immediately force-moves
-//!   it to `pending_ocr` (see `bill::force_status`'s doc comment) — there
-//!   is no OCR pipeline yet, so nothing currently drives a bill out of
-//!   `pending_ocr`. The Receipt Recognizer component owns
-//!   `POST /b/{id}/photo`, the `pending_ocr <-> awaiting_photo_retry`
-//!   loop, and the eventual `-> pending_confirmation` transition.
 //! - There is no `GET /b/{id}/review` / item-CRUD route wired here yet
-//!   either (also Recognizer/Mobile-Client territory) — but the
-//!   underlying `pricing::api::add_items` already accepts calls in any
-//!   pre-open status, so those routes can be added without further schema
-//!   changes.
+//!   (Mobile-Client territory) — but the underlying
+//!   `pricing::api::add_items` already accepts calls in any pre-open
+//!   status, so those routes can be added without further schema changes.
 //! - No HTML templates: every response is a `format!`-built string.
+//!
+//! `POST /b/{id}/photo` (the Receipt Recognizer's upload/OCR/reconcile
+//! endpoint that actually drives `pending_ocr <-> awaiting_photo_retry ->
+//! pending_confirmation`) lives in `src/routes/receipt.rs`, merged into
+//! this module's router by `src/routes/mod.rs`.
 
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
@@ -26,12 +24,14 @@ use axum::{Form, Json, Router};
 use axum_extra::extract::cookie::CookieJar;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use std::sync::Arc;
 
 use crate::bill::{self, token::generate_token, token::hash_token};
 use crate::host_auth::{self, HostAuthError};
 use crate::pricing::api::{self as pricing_api, PRE_OPEN_STATUSES};
 use crate::pricing::PriceDistributorError;
 use crate::qr;
+use crate::receipt::OcrEngine;
 
 /// Shared app state threaded through every handler.
 #[derive(Clone)]
@@ -41,6 +41,13 @@ pub struct AppState {
     /// `https://sharepay.example`. No trailing slash required (stripped in
     /// [`qr::join_url`] if present).
     pub base_url: String,
+    /// The OCR backend used by `POST /b/{id}/photo` (`src/routes/receipt.rs`).
+    /// `Arc<dyn OcrEngine>` rather than a concrete type so the Tesseract
+    /// implementation stays swappable (spec §1.1) and so the one
+    /// long-lived engine instance (expensive to construct — loads
+    /// trained-data from disk) is cheaply cloned across requests via
+    /// `AppState::clone()`.
+    pub ocr_engine: Arc<dyn OcrEngine>,
 }
 
 // ---------------------------------------------------------------------
@@ -248,12 +255,10 @@ pub async fn create_bill_handler(
 ) -> Result<impl IntoResponse, AppError> {
     let (bill_id, host_token) = create_bill_with_retry(&state.pool).await?;
 
-    // STUB (see module docs): no OCR pipeline exists yet, so we
-    // immediately move the bill from draft to pending_ocr ourselves. The
-    // Receipt Recognizer component replaces this with a real
-    // `POST /b/{id}/photo` handler that performs this transition (and the
-    // subsequent ones) for real.
-    bill::force_status(&state.pool, &bill_id, "pending_ocr")
+    // draft -> pending_ocr: the bill now waits for the host's first photo
+    // upload (spec §2.1/§2.5). A real production transition, not a test
+    // stub — see `bill::mark_pending_ocr`'s doc comment.
+    bill::mark_pending_ocr(&state.pool, &bill_id)
         .await
         .map_err(AppError::from_db)?;
 
@@ -262,7 +267,7 @@ pub async fn create_bill_handler(
     let body = format!(
         "<h1>Bill created</h1>\
          <p>bill_id={bill_id}</p>\
-         <p>status=pending_ocr (OCR not yet wired up — stub)</p>\
+         <p>status=pending_ocr — upload a photo to <code>POST /b/{bill_id}/photo</code></p>\
          <p>Save this host recovery link for cross-device access: \
          <a href=\"{recovery_url}\">{recovery_url}</a></p>\
          <p><a href=\"/b/{bill_id}/host\">Continue to host view</a></p>"
@@ -293,6 +298,17 @@ pub async fn host_view(
     } else if status == "pending_confirmation" {
         body.push_str(&format!(
             "<form method=\"post\" action=\"/b/{bill_id}/confirm\"><button type=\"submit\">Confirm and generate QR code</button></form>"
+        ));
+    } else if status == "pending_ocr" || status == "awaiting_photo_retry" {
+        let hint = if status == "awaiting_photo_retry" {
+            "<p>We couldn't quite read that receipt — try another photo (better lighting / a flat receipt helps).</p>"
+        } else {
+            ""
+        };
+        body.push_str(&format!(
+            "{hint}<form method=\"post\" action=\"/b/{bill_id}/photo\" enctype=\"multipart/form-data\">\
+             <input type=\"file\" name=\"photo\" accept=\"image/*\" required>\
+             <button type=\"submit\">Upload receipt photo</button></form>"
         ));
     }
     Ok(Html(body))

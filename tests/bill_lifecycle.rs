@@ -9,20 +9,32 @@
 //! parsed some items and reconciled the total" (out of scope for this
 //! component — see `src/routes/bill.rs` module docs).
 
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sharepay::db::{init_pool, DbConfig};
 use sharepay::pricing::api::{add_items, NewItem};
+use sharepay::receipt::TesseractEngine;
 use sharepay::routes::{router, AppState};
 use sharepay::{bill, pricing};
 use tower::ServiceExt;
 
 async fn test_app() -> (axum::Router, sqlx::SqlitePool) {
     let pool = init_pool(&DbConfig::in_memory()).await.unwrap();
+    // Real Tesseract engine (relies on this dev machine's Homebrew install
+    // resolving `eng.traineddata` via its compiled-in default path — see
+    // `src/main.rs`'s `TESSDATA_PREFIX_ENV_VAR` docs). This test file
+    // doesn't exercise `POST /b/{id}/photo` itself (that's covered in
+    // `tests/receipt_photo.rs`), so the engine is constructed but never
+    // called here.
+    let ocr_engine: Arc<dyn sharepay::receipt::OcrEngine> =
+        Arc::new(TesseractEngine::new(None, "eng").expect("Tesseract engine should initialize"));
     let state = AppState {
         pool: pool.clone(),
         base_url: "https://sharepay.example".to_string(),
+        ocr_engine,
     };
     (router(state), pool)
 }
@@ -60,8 +72,9 @@ fn all_set_cookies(response: &axum::response::Response) -> Vec<String> {
 async fn full_bill_lifecycle_over_http() {
     let (app, pool) = test_app().await;
 
-    // 1. POST /bills -> draft, immediately stub-advanced to pending_ocr,
-    //    host cookie issued.
+    // 1. POST /bills -> draft, immediately advanced to pending_ocr (real
+    //    transition, waiting for the host's first photo), host cookie
+    //    issued.
     let resp = app
         .clone()
         .oneshot(
