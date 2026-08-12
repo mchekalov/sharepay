@@ -1,0 +1,13 @@
+/target
+
+# SQLite database files (runtime data, not source)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Keep migrations tracked
+!migrations/*.sql
+
+# Editor / OS
+.DS_Store
