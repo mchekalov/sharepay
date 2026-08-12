@@ -1,0 +1,17 @@
+{% extends "shell.html" %}
+{% block content %}
+<h1>Does this look right?</h1>
+<p>Edit any item, delete a wrong row, or add a missing one — then confirm.</p>
+<form id="review-form" method="post" action="/b/{{ bill_id }}/confirm"
+      hx-post="/b/{{ bill_id }}/confirm" hx-target="body" hx-swap="outerHTML">
+  <table id="items-table">
+    <thead><tr><th>Item</th><th>Price</th><th></th></tr></thead>
+    <tbody>
+      {% for row in item_rows %}{{ row|safe }}{% endfor %}
+    </tbody>
+  </table>
+  <button type="button" id="add-item-btn" class="btn-secondary" hx-post="/b/{{ bill_id }}/items" hx-target="#items-table tbody" hx-swap="beforeend">+ Add item</button>
+  {{ totals_footer|safe }}
+  <button type="submit" class="btn-primary btn-big">Confirm and generate QR code</button>
+</form>
+{% endblock %}

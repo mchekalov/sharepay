@@ -1,30 +1,25 @@
 //! HTTP routes implementing the QR/Session Management API surface (spec
-//! §2.8). Handlers here own routing, state transitions, and cookie/auth
-//! gating — **not** presentation. Responses are minimal placeholder
-//! HTML/JSON; real templates are the Mobile Client component's job
-//! (spec §4).
-//!
-//! ## What's stubbed / deferred here
-//! - There is no `GET /b/{id}/review` / item-CRUD route wired here yet
-//!   (Mobile-Client territory) — but the underlying
-//!   `pricing::api::add_items` already accepts calls in any pre-open
-//!   status, so those routes can be added without further schema changes.
-//! - No HTML templates: every response is a `format!`-built string.
+//! §2.8), rendering the Mobile Web Client's templates (spec §4). Handlers
+//! here own routing, state transitions, cookie/auth gating, **and**
+//! presentation — real `askama` templates (`src/templates.rs`,
+//! `templates/*.html`), not placeholder `format!` strings.
 //!
 //! `POST /b/{id}/photo` (the Receipt Recognizer's upload/OCR/reconcile
 //! endpoint that actually drives `pending_ocr <-> awaiting_photo_retry ->
 //! pending_confirmation`) lives in `src/routes/receipt.rs`, merged into
 //! this module's router by `src/routes/mod.rs`.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use axum::routing::{get, post};
-use axum::{Form, Json, Router};
+use axum::routing::{delete, get, post};
+use axum::{Form, Router};
 use axum_extra::extract::cookie::CookieJar;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::SqlitePool;
-use std::sync::Arc;
 
 use crate::bill::{self, token::generate_token, token::hash_token};
 use crate::host_auth::{self, HostAuthError};
@@ -32,6 +27,10 @@ use crate::pricing::api::{self as pricing_api, PRE_OPEN_STATUSES};
 use crate::pricing::PriceDistributorError;
 use crate::qr;
 use crate::receipt::OcrEngine;
+use crate::templates::{
+    self, render, ErrorTemplate, HostQrTemplate, HostUploadTemplate, JoinedFragmentTemplate,
+    LandingTemplate, NameEntryTemplate, NotReadyTemplate,
+};
 
 /// Shared app state threaded through every handler.
 #[derive(Clone)]
@@ -90,9 +89,7 @@ impl From<PriceDistributorError> for AppError {
             PriceDistributorError::InvalidDisplayName => {
                 AppError::BadRequest("invalid display name".into())
             }
-            PriceDistributorError::IdCollision => {
-                AppError::Internal("id collision".into())
-            }
+            PriceDistributorError::IdCollision => AppError::Internal("id collision".into()),
             PriceDistributorError::Database(e) => AppError::from_db(e),
         }
     }
@@ -100,17 +97,25 @@ impl From<PriceDistributorError> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+        let (status, title, message) = match self {
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "Not found", msg),
             AppError::Unauthorized => (
                 StatusCode::UNAUTHORIZED,
+                "Not authorized",
                 "you don't have host access to this bill".to_string(),
             ),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "Can't do that", msg),
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "Bad request", msg),
+            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, "Something broke", msg),
         };
-        (status, Html(format!("<p>{message}</p>"))).into_response()
+        (
+            status,
+            render(ErrorTemplate {
+                title: title.to_string(),
+                message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -132,94 +137,14 @@ async fn require_host(pool: &SqlitePool, jar: &CookieJar, bill_id: &str) -> Resu
 }
 
 async fn require_status(pool: &SqlitePool, bill_id: &str) -> Result<String, AppError> {
-    bill::get_status(pool, bill_id)
+    match bill::get_status(pool, bill_id)
         .await
         .map_err(AppError::from_db)?
-        .ok_or_else(|| AppError::NotFound("this bill link isn't valid or has expired".into()))
-}
-
-// ---------------------------------------------------------------------
-// JSON DTOs for the polling endpoints (kept local to the HTTP layer so
-// `pricing::api`'s types stay free of serde/HTTP concerns).
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-struct MarkerJson {
-    participant_id: String,
-    display_name: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ItemJson {
-    id: i64,
-    name: String,
-    price_cents: i64,
-    markers: Vec<MarkerJson>,
-    is_marked_by_me: bool,
-    per_marker_share: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-struct ParticipantJson {
-    id: String,
-    display_name: String,
-    dish_subtotal: i64,
-    tax_tip_share: i64,
-    total: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct BillStateJson {
-    status: String,
-    items: Vec<ItemJson>,
-    participants: Vec<ParticipantJson>,
-    my_total: i64,
-    assigned_total: i64,
-    unassigned_amount: i64,
-    receipt_total: Option<i64>,
-    tax_tip_amount: i64,
-}
-
-impl From<pricing_api::BillState> for BillStateJson {
-    fn from(s: pricing_api::BillState) -> Self {
-        BillStateJson {
-            status: s.status,
-            items: s
-                .items
-                .into_iter()
-                .map(|i| ItemJson {
-                    id: i.id,
-                    name: i.name,
-                    price_cents: i.price_cents,
-                    markers: i
-                        .markers
-                        .into_iter()
-                        .map(|m| MarkerJson {
-                            participant_id: m.participant_id,
-                            display_name: m.display_name,
-                        })
-                        .collect(),
-                    is_marked_by_me: i.is_marked_by_me,
-                    per_marker_share: i.per_marker_share,
-                })
-                .collect(),
-            participants: s
-                .participants
-                .into_iter()
-                .map(|p| ParticipantJson {
-                    id: p.id,
-                    display_name: p.display_name,
-                    dish_subtotal: p.dish_subtotal,
-                    tax_tip_share: p.tax_tip_share,
-                    total: p.total,
-                })
-                .collect(),
-            my_total: s.my_total,
-            assigned_total: s.assigned_total,
-            unassigned_amount: s.unassigned_amount,
-            receipt_total: s.receipt_total,
-            tax_tip_amount: s.tax_tip_amount,
-        }
+    {
+        Some(s) if s != bill::EXPIRED_STATUS => Ok(s),
+        _ => Err(AppError::NotFound(
+            "this bill link isn't valid or has expired".into(),
+        )),
     }
 }
 
@@ -248,7 +173,16 @@ async fn create_bill_with_retry(pool: &SqlitePool) -> Result<(String, String), A
     ))
 }
 
-/// `POST /bills` — create a bill in `draft`, issue the host cookie.
+/// `GET /` — landing/upload page (spec §4.3.1).
+pub async fn landing() -> impl IntoResponse {
+    render(LandingTemplate)
+}
+
+/// `POST /bills` — create a bill in `draft`, issue the host cookie, and
+/// `303`-redirect to the host page (spec §2.1/§4.3.1: creating the bill
+/// first, as its own step, gives the host a stable `bill_id` to attach the
+/// photo/OCR-retry loop to; the join URL/QR stays invalid until
+/// confirmation regardless).
 pub async fn create_bill_handler(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -256,62 +190,81 @@ pub async fn create_bill_handler(
     let (bill_id, host_token) = create_bill_with_retry(&state.pool).await?;
 
     // draft -> pending_ocr: the bill now waits for the host's first photo
-    // upload (spec §2.1/§2.5). A real production transition, not a test
-    // stub — see `bill::mark_pending_ocr`'s doc comment.
+    // upload (spec §2.1/§2.5).
     bill::mark_pending_ocr(&state.pool, &bill_id)
         .await
         .map_err(AppError::from_db)?;
 
     let jar = host_auth::set_host_cookie(jar, &bill_id, &host_token);
-    let recovery_url = format!("/b/{bill_id}/host/{host_token}");
-    let body = format!(
-        "<h1>Bill created</h1>\
-         <p>bill_id={bill_id}</p>\
-         <p>status=pending_ocr — upload a photo to <code>POST /b/{bill_id}/photo</code></p>\
-         <p>Save this host recovery link for cross-device access: \
-         <a href=\"{recovery_url}\">{recovery_url}</a></p>\
-         <p><a href=\"/b/{bill_id}/host\">Continue to host view</a></p>"
-    );
-    Ok((StatusCode::CREATED, jar, Html(body)))
+    Ok((
+        StatusCode::SEE_OTHER,
+        jar,
+        Redirect::to(&format!("/b/{bill_id}/host")),
+    ))
 }
 
-/// `GET /b/{id}/host` — host view (QR/join link once open, controls
-/// otherwise). Host-gated.
+/// `GET /b/{id}/host` — host view (upload/retry/review/QR, contextual on
+/// status). Host-gated.
 pub async fn host_view(
     State(state): State<AppState>,
     Path(bill_id): Path<String>,
     jar: CookieJar,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     require_host(&state.pool, &jar, &bill_id).await?;
     let status = require_status(&state.pool, &bill_id).await?;
 
-    let mut body = format!("<h1>Host view</h1><p>bill_id={bill_id}</p><p>status={status}</p>");
-    if status == "open" {
-        let url = qr::join_url(&state.base_url, &bill_id);
-        let svg_xml = qr::render_svg(&url).map_err(|e| AppError::Internal(e.to_string()))?;
-        body.push_str(&format!(
-            "<p>Join link: <a href=\"{url}\">{url}</a></p>\
-             <div>{svg_xml}</div>\
-             <p><img src=\"/b/{bill_id}/qr.svg\" alt=\"QR code to join this bill\"></p>\
-             <form method=\"post\" action=\"/b/{bill_id}/close\"><button type=\"submit\">Close bill</button></form>"
-        ));
-    } else if status == "pending_confirmation" {
-        body.push_str(&format!(
-            "<form method=\"post\" action=\"/b/{bill_id}/confirm\"><button type=\"submit\">Confirm and generate QR code</button></form>"
-        ));
-    } else if status == "pending_ocr" || status == "awaiting_photo_retry" {
-        let hint = if status == "awaiting_photo_retry" {
-            "<p>We couldn't quite read that receipt — try another photo (better lighting / a flat receipt helps).</p>"
-        } else {
-            ""
-        };
-        body.push_str(&format!(
-            "{hint}<form method=\"post\" action=\"/b/{bill_id}/photo\" enctype=\"multipart/form-data\">\
-             <input type=\"file\" name=\"photo\" accept=\"image/*\" required>\
-             <button type=\"submit\">Upload receipt photo</button></form>"
-        ));
+    match status.as_str() {
+        "pending_ocr" => Ok(render(HostUploadTemplate {
+            bill_id,
+            retry_message: None,
+        })
+        .into_response()),
+        "awaiting_photo_retry" => Ok(render(HostUploadTemplate {
+            bill_id,
+            retry_message: Some(
+                "Good lighting and a flat receipt help a lot — give it another shot.".to_string(),
+            ),
+        })
+        .into_response()),
+        "pending_confirmation" => {
+            let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
+            Ok(render(templates::host_review_page(&bill_id, &bill_state)).into_response())
+        }
+        "open" => Ok(render(host_qr_template(&state, &bill_id).await?).into_response()),
+        "closed" => {
+            let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
+            Ok(render(templates::participant_page(&bill_id, &bill_state, None)).into_response())
+        }
+        other => Err(AppError::Internal(format!("unexpected bill status {other:?}"))),
     }
-    Ok(Html(body))
+}
+
+async fn host_qr_template(state: &AppState, bill_id: &str) -> Result<HostQrTemplate, AppError> {
+    let url = qr::join_url(&state.base_url, bill_id);
+    let svg_xml = qr::render_svg(&url).map_err(|e| AppError::Internal(e.to_string()))?;
+    let joined_html = render(joined_fragment_template(&state.pool, bill_id).await?).0;
+    Ok(HostQrTemplate {
+        bill_id: bill_id.to_string(),
+        join_url: url,
+        qr_svg: svg_xml,
+        joined_html,
+    })
+}
+
+async fn joined_fragment_template(
+    pool: &SqlitePool,
+    bill_id: &str,
+) -> Result<JoinedFragmentTemplate, AppError> {
+    let bill_state = pricing_api::get_bill_state(pool, bill_id, None).await?;
+    let names: Vec<String> = bill_state
+        .participants
+        .iter()
+        .map(|p| p.display_name.clone())
+        .collect();
+    Ok(JoinedFragmentTemplate {
+        count: names.len(),
+        names,
+    })
 }
 
 /// `GET /b/{id}/host/{host_token}` — one-time host recovery link: sets the
@@ -335,12 +288,55 @@ pub async fn host_recovery(
     Ok((jar, Redirect::to(&format!("/b/{bill_id}/host"))))
 }
 
-/// `POST /b/{id}/confirm` — `pending_confirmation -> open`, host-gated,
-/// idempotent on an already-`open` bill (spec §2.7).
+/// `POST /b/{id}/items` — host-only: append a blank item row (spec §4.3.4's
+/// "+ Add item"). Returns the new row's markup (appended `beforeend` into
+/// `#items-table tbody`) plus an out-of-band totals-footer swap.
+pub async fn add_item_handler(
+    State(state): State<AppState>,
+    Path(bill_id): Path<String>,
+    jar: CookieJar,
+) -> Result<impl IntoResponse, AppError> {
+    require_host(&state.pool, &jar, &bill_id).await?;
+    let ids = pricing_api::add_items(
+        &state.pool,
+        &bill_id,
+        vec![pricing_api::NewItem {
+            name: String::new(),
+            price_cents: 0,
+        }],
+    )
+    .await?;
+    let item_id = ids[0];
+    let row_html = templates::review_row(&bill_id, item_id, "", 0);
+    let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
+    let footer_html = templates::totals_footer(&bill_state, true);
+    Ok(Html(format!("{row_html}{footer_html}")))
+}
+
+/// `DELETE /b/{id}/items/{item_id}` — host-only: remove a row (spec
+/// §4.3.4's 🗑 button). Response body is just the out-of-band
+/// totals-footer swap; the (empty) remainder is what removes the row via
+/// the client's `hx-target="closest tr" hx-swap="outerHTML"`.
+pub async fn delete_item_handler(
+    State(state): State<AppState>,
+    Path((bill_id, item_id)): Path<(String, i64)>,
+    jar: CookieJar,
+) -> Result<impl IntoResponse, AppError> {
+    require_host(&state.pool, &jar, &bill_id).await?;
+    pricing_api::delete_item(&state.pool, &bill_id, item_id).await?;
+    let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
+    Ok(Html(templates::totals_footer(&bill_state, true)))
+}
+
+/// `POST /b/{id}/confirm` — host-gated, idempotent on an already-`open`
+/// bill (spec §2.7). Applies any in-place item-name/price edits from the
+/// review form (spec §4.3.4: "Server re-parses current form values,
+/// recomputes the sum") before transitioning `pending_confirmation -> open`.
 pub async fn confirm_bill(
     State(state): State<AppState>,
     Path(bill_id): Path<String>,
     jar: CookieJar,
+    Form(fields): Form<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, AppError> {
     require_host(&state.pool, &jar, &bill_id).await?;
     let status = require_status(&state.pool, &bill_id).await?;
@@ -351,15 +347,44 @@ pub async fn confirm_bill(
         )));
     }
 
+    if status == "pending_confirmation" {
+        apply_review_edits(&state.pool, &bill_id, &fields).await?;
+    }
+
     pricing_api::open_bill(&state.pool, &bill_id).await?;
 
-    let url = qr::join_url(&state.base_url, &bill_id);
-    let svg_xml = qr::render_svg(&url).map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Html(format!(
-        "<h1>Ready! Show this to your friends</h1>\
-         <div>{svg_xml}</div>\
-         <p>{url}</p>"
-    )))
+    Ok(render(host_qr_template(&state, &bill_id).await?))
+}
+
+/// Parses `item_name_{id}`/`item_price_{id}` fields posted by the review
+/// form and persists any that changed via [`pricing_api::update_item`].
+/// Price fields are parsed as decimal dollars (matching the
+/// `<input type="number" step="0.01">` the client renders) and rounded to
+/// the nearest cent.
+async fn apply_review_edits(
+    pool: &SqlitePool,
+    bill_id: &str,
+    fields: &HashMap<String, String>,
+) -> Result<(), AppError> {
+    for (key, value) in fields {
+        let Some(id_str) = key.strip_prefix("item_name_") else {
+            continue;
+        };
+        let Ok(item_id) = id_str.parse::<i64>() else {
+            continue;
+        };
+        let name = value.trim();
+        if name.is_empty() {
+            continue; // never persist a blank name over the OCR'd one
+        }
+        let price_cents = fields
+            .get(&format!("item_price_{item_id}"))
+            .and_then(|p| p.trim().parse::<f64>().ok())
+            .map(|dollars| (dollars * 100.0).round() as i64)
+            .unwrap_or(0);
+        pricing_api::update_item(pool, bill_id, item_id, name, price_cents).await?;
+    }
+    Ok(())
 }
 
 /// `POST /b/{id}/close` — `open -> closed`, host-gated, idempotent on an
@@ -371,9 +396,8 @@ pub async fn close_bill_handler(
 ) -> Result<impl IntoResponse, AppError> {
     require_host(&state.pool, &jar, &bill_id).await?;
     pricing_api::close_bill(&state.pool, &bill_id).await?;
-    Ok(Html(format!(
-        "<h1>Bill closed</h1><p>bill_id={bill_id}</p>"
-    )))
+    let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
+    Ok(render(templates::participant_page(&bill_id, &bill_state, None)))
 }
 
 /// `GET /b/{id}/qr.svg` — QR code for the join URL. Only served once
@@ -393,39 +417,16 @@ pub async fn qr_svg(
     Ok(([(header::CONTENT_TYPE, "image/svg+xml")], svg_xml))
 }
 
-fn render_name_entry(bill_id: &str) -> String {
-    format!(
-        "<h1>What's your name?</h1>\
-         <form method=\"post\" action=\"/b/{bill_id}/join\">\
-         <input type=\"text\" name=\"display_name\" maxlength=\"40\" required autofocus>\
-         <button type=\"submit\">Join</button></form>"
-    )
-}
-
-fn render_bill_state_html(bill_id: &str, state: &pricing_api::BillState) -> String {
-    let mut rows = String::new();
-    for item in &state.items {
-        let names: Vec<&str> = item
-            .markers
-            .iter()
-            .map(|m| m.display_name.as_str())
-            .collect();
-        rows.push_str(&format!(
-            "<li>{} — ${:.2} [{}]{}</li>",
-            item.name,
-            item.price_cents as f64 / 100.0,
-            names.join(", "),
-            if item.is_marked_by_me { " (you)" } else { "" }
-        ));
-    }
-    format!(
-        "<h1>Bill {bill_id}</h1><p>status={}</p><ul>{rows}</ul>\
-         <p>Your total: ${:.2}</p>\
-         <p>Unassigned: ${:.2}</p>",
-        state.status,
-        state.my_total as f64 / 100.0,
-        state.unassigned_amount as f64 / 100.0
-    )
+/// `GET /b/{id}/joined-fragment` — host's live join-count poll target
+/// (spec §4.3.5), scoped narrowly to just this fragment. Host-gated (same
+/// audience as the QR page it's embedded in).
+pub async fn joined_fragment(
+    State(state): State<AppState>,
+    Path(bill_id): Path<String>,
+    jar: CookieJar,
+) -> Result<impl IntoResponse, AppError> {
+    require_host(&state.pool, &jar, &bill_id).await?;
+    Ok(render(joined_fragment_template(&state.pool, &bill_id).await?))
 }
 
 /// `GET /b/{id}` — participant entry point (spec §2.4/§2.7): routes to
@@ -435,33 +436,23 @@ pub async fn bill_entry(
     State(state): State<AppState>,
     Path(bill_id): Path<String>,
     jar: CookieJar,
-) -> Result<impl IntoResponse, AppError> {
-    let status = bill::get_status(&state.pool, &bill_id)
-        .await
-        .map_err(AppError::from_db)?;
-    let status = match status {
-        Some(s) if s != "expired" => s,
-        _ => {
-            return Err(AppError::NotFound(
-                "this bill link isn't valid or has expired".into(),
-            ))
-        }
-    };
+) -> Result<Response, AppError> {
+    let status = require_status(&state.pool, &bill_id).await?;
 
     if status == "closed" {
         let participant_id = host_auth::participant_id_from_jar(&jar, &bill_id);
         let bill_state =
             pricing_api::get_bill_state(&state.pool, &bill_id, participant_id.as_deref()).await?;
-        return Ok(Html(format!(
-            "<h1>Bill closed — final totals</h1>{}",
-            render_bill_state_html(&bill_id, &bill_state)
-        )));
+        return Ok(render(templates::participant_page(
+            &bill_id,
+            &bill_state,
+            participant_id.as_deref(),
+        ))
+        .into_response());
     }
 
     if PRE_OPEN_STATUSES.contains(&status.as_str()) {
-        return Ok(Html(format!(
-            "<h1>This bill isn't ready yet</h1><p>Ask the host. (status={status})</p>"
-        )));
+        return Ok(render(NotReadyTemplate).into_response());
     }
 
     // status == "open"
@@ -469,9 +460,15 @@ pub async fn bill_entry(
         Some(participant_id) => {
             let bill_state =
                 pricing_api::get_bill_state(&state.pool, &bill_id, Some(&participant_id)).await?;
-            Ok(Html(render_bill_state_html(&bill_id, &bill_state)))
+            Ok(render(templates::participant_page(&bill_id, &bill_state, Some(&participant_id)))
+                .into_response())
         }
-        None => Ok(Html(render_name_entry(&bill_id))),
+        None => Ok(render(NameEntryTemplate {
+            bill_id,
+            error: None,
+            name_value: String::new(),
+        })
+        .into_response()),
     }
 }
 
@@ -481,25 +478,44 @@ pub struct JoinForm {
 }
 
 /// `POST /b/{id}/join` — name entry, creates the `Participant`, issues the
-/// participant cookie.
+/// participant cookie. On a duplicate/invalid name, re-renders the name
+/// entry form with an inline error and the entered value preserved (spec
+/// §4.4.1), rather than a bare error page.
 pub async fn join_bill_handler(
     State(state): State<AppState>,
     Path(bill_id): Path<String>,
     jar: CookieJar,
     Form(form): Form<JoinForm>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let participant_id = generate_token();
-    let id =
-        pricing_api::join_bill(&state.pool, &bill_id, &participant_id, &form.display_name)
-            .await?;
-    let jar = host_auth::set_participant_cookie(jar, &bill_id, &id);
-    Ok((jar, Redirect::to(&format!("/b/{bill_id}"))))
+    match pricing_api::join_bill(&state.pool, &bill_id, &participant_id, &form.display_name).await
+    {
+        Ok(id) => {
+            let jar = host_auth::set_participant_cookie(jar, &bill_id, &id);
+            Ok((jar, Redirect::to(&format!("/b/{bill_id}"))).into_response())
+        }
+        Err(PriceDistributorError::NameTaken) => Ok(render(NameEntryTemplate {
+            bill_id,
+            error: Some("That name's taken — try adding a last initial.".to_string()),
+            name_value: form.display_name,
+        })
+        .into_response()),
+        Err(PriceDistributorError::InvalidDisplayName) => Ok(render(NameEntryTemplate {
+            bill_id,
+            error: Some("Please enter a name.".to_string()),
+            name_value: form.display_name,
+        })
+        .into_response()),
+        Err(e) => Err(e.into()),
+    }
 }
 
-/// `GET /b/{id}/items` — polling endpoint: item list + marks + running
-/// totals. Gated to `open`/`closed`; scopes `is_marked_by_me`/`my_total` to
-/// the participant cookie if present.
-pub async fn items_poll(
+/// `GET /b/{id}/fragment` — polling endpoint (spec §4.4.2/§4.4.3):
+/// authoritative item list + marks + your-total, as the bare
+/// `#bill-fragment` partial (no page shell). Gated to `open`/`closed`;
+/// scopes `is_marked_by_me`/`my_total`/"You" labeling to the participant
+/// cookie if present.
+pub async fn fragment_handler(
     State(state): State<AppState>,
     Path(bill_id): Path<String>,
     jar: CookieJar,
@@ -513,11 +529,16 @@ pub async fn items_poll(
     let participant_id = host_auth::participant_id_from_jar(&jar, &bill_id);
     let bill_state =
         pricing_api::get_bill_state(&state.pool, &bill_id, participant_id.as_deref()).await?;
-    Ok(Json(BillStateJson::from(bill_state)))
+    Ok(render(templates::bill_fragment(
+        &bill_id,
+        &bill_state,
+        participant_id.as_deref(),
+    )))
 }
 
 /// `POST /b/{id}/items/{item_id}/mark` — toggle on. Participant-cookie
-/// gated, `open` only.
+/// gated, `open` only. Returns the same `#bill-fragment` partial the poll
+/// endpoint does (spec §4.4.3: "Response is the full bill-fragment").
 pub async fn mark_item_handler(
     State(state): State<AppState>,
     Path((bill_id, item_id)): Path<(String, i64)>,
@@ -528,7 +549,11 @@ pub async fn mark_item_handler(
     pricing_api::mark_item(&state.pool, &bill_id, item_id, &participant_id).await?;
     let bill_state =
         pricing_api::get_bill_state(&state.pool, &bill_id, Some(&participant_id)).await?;
-    Ok(Json(BillStateJson::from(bill_state)))
+    Ok(render(templates::bill_fragment(
+        &bill_id,
+        &bill_state,
+        Some(&participant_id),
+    )))
 }
 
 /// `DELETE /b/{id}/items/{item_id}/mark` — toggle off.
@@ -542,19 +567,30 @@ pub async fn unmark_item_handler(
     pricing_api::unmark_item(&state.pool, &bill_id, item_id, &participant_id).await?;
     let bill_state =
         pricing_api::get_bill_state(&state.pool, &bill_id, Some(&participant_id)).await?;
-    Ok(Json(BillStateJson::from(bill_state)))
+    Ok(render(templates::bill_fragment(
+        &bill_id,
+        &bill_state,
+        Some(&participant_id),
+    )))
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
+        .route("/", get(landing))
         .route("/bills", post(create_bill_handler))
         .route("/b/{bill_id}/confirm", post(confirm_bill))
         .route("/b/{bill_id}/host", get(host_view))
         .route("/b/{bill_id}/host/{host_token}", get(host_recovery))
         .route("/b/{bill_id}/close", post(close_bill_handler))
         .route("/b/{bill_id}/qr.svg", get(qr_svg))
+        .route("/b/{bill_id}/joined-fragment", get(joined_fragment))
         .route("/b/{bill_id}/join", post(join_bill_handler))
-        .route("/b/{bill_id}/items", get(items_poll))
+        .route("/b/{bill_id}/fragment", get(fragment_handler))
+        .route(
+            "/b/{bill_id}/items",
+            post(add_item_handler),
+        )
+        .route("/b/{bill_id}/items/{item_id}", delete(delete_item_handler))
         .route(
             "/b/{bill_id}/items/{item_id}/mark",
             post(mark_item_handler).delete(unmark_item_handler),

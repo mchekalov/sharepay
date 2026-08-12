@@ -1,0 +1,3 @@
+<div id="totals-footer"{% if oob %} hx-swap-oob="true"{% endif %}>
+  <p>Items subtotal: {{ items_subtotal_display }} &nbsp; Tax &amp; tip: {{ tax_tip_display }} &nbsp; Receipt total: {{ receipt_total_display }}{% if reconciled %} ✅{% endif %}</p>
+</div>

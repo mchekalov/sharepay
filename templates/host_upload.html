@@ -1,0 +1,22 @@
+{% extends "shell.html" %}
+{% block content %}
+{% if let Some(msg) = retry_message %}
+<h1>⚠️ We couldn't quite read that receipt</h1>
+<p class="error">{{ msg }}</p>
+{% else %}
+<h1>Photograph your receipt</h1>
+<p>Lay it flat, fill the frame, and avoid glare for the best results.</p>
+{% endif %}
+<form hx-post="/b/{{ bill_id }}/photo" hx-encoding="multipart/form-data" hx-target="body" hx-swap="outerHTML" hx-indicator="#upload-indicator"
+      method="post" action="/b/{{ bill_id }}/photo" enctype="multipart/form-data">
+  <label class="btn-primary file-btn">
+    📷 {% if retry_message.is_some() %}Retake photo{% else %}Take a photo of the receipt{% endif %}
+    <input type="file" name="photo" accept="image/*" capture="environment" onchange="this.form.requestSubmit()">
+  </label>
+  <label class="btn-secondary file-btn">
+    🖼️ {% if retry_message.is_some() %}Choose another photo{% else %}Choose from library{% endif %}
+    <input type="file" name="photo" accept="image/*" onchange="this.form.requestSubmit()">
+  </label>
+  <div id="upload-indicator" class="htmx-indicator">Uploading…</div>
+</form>
+{% endblock %}

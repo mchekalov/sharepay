@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use tower_http::services::ServeDir;
+
 use sharepay::cleanup;
 use sharepay::db::{self, DbConfig};
 use sharepay::receipt::TesseractEngine;
@@ -57,7 +59,7 @@ async fn main() {
         ocr_engine,
     };
 
-    let app = router(state);
+    let app = router(state).nest_service("/static", ServeDir::new("static"));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await

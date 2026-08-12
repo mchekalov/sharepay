@@ -1,0 +1,23 @@
+<div id="bill-fragment"
+     {% if !is_closed %}hx-get="/b/{{ bill_id }}/fragment" hx-trigger="every 4s" hx-target="#bill-fragment" hx-swap="outerHTML"{% endif %}>
+  {% if is_closed %}<p class="closed-banner">This bill is closed — final totals below.</p>{% endif %}
+  <div class="item-list">
+    {% for item in items %}
+    <div class="item-row"
+         role="checkbox" aria-checked="{{ item.marked }}" tabindex="0"
+         {% if !is_closed %}hx-{% if item.marked %}delete{% else %}post{% endif %}="/b/{{ bill_id }}/items/{{ item.id }}/mark" hx-target="#bill-fragment" hx-swap="outerHTML"{% endif %}>
+      <span class="checkbox">{% if item.marked %}✅{% else %}☐{% endif %}</span>
+      <span class="item-name">{{ item.name }}</span>
+      <span class="item-price">{{ item.price_display }}</span>
+      <span class="markers">{{ item.markers_display }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% if let Some(unassigned) = unassigned_display %}
+  <p class="unassigned-note">⚠️ Unclaimed items: {{ unassigned }} — ask around!</p>
+  {% endif %}
+  <p class="your-total">Your total: <strong>{{ my_total_display }}</strong> <span class="hint">(includes your share of tax &amp; tip)</span></p>
+  {% if !is_closed %}
+  <button type="button" class="copy-btn btn-primary btn-big" data-copy-text="{{ copy_text }}">📋 Copy my total</button>
+  {% endif %}
+</div>

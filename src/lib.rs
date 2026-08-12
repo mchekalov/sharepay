@@ -13,3 +13,4 @@ pub mod pricing;
 pub mod qr;
 pub mod receipt;
 pub mod routes;
+pub mod templates;

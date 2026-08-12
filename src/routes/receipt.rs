@@ -36,9 +36,8 @@ use axum::extract::{Multipart, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::Router;
 use axum_extra::extract::cookie::CookieJar;
-use serde::Serialize;
 
 use crate::bill;
 use crate::host_auth;
@@ -48,6 +47,7 @@ use crate::receipt::preprocess::{self, PreprocessError};
 use crate::receipt::reconcile::{self, OverallConfidence, ReconcileInput, ReconcileOutcome};
 use crate::receipt::{OcrEngine, OcrError};
 use crate::routes::bill::AppState;
+use crate::templates::{self, render, ErrorTemplate, HostUploadTemplate};
 
 /// Max accepted upload size (spec §1.6: "Upload too large... 400 before
 /// processing"). 15 MB comfortably covers a modern phone-camera JPEG while
@@ -73,150 +73,119 @@ pub(crate) enum PhotoUploadError {
     /// `400` before any processing: bad multipart shape, missing field,
     /// oversized upload, or an unrecognized content-type.
     BadRequest(String),
-    ImageUnreadable,
-    NoTextDetected,
-    OcrTimeout,
-    NoReceiptDetected,
+    ImageUnreadable { bill_id: String },
+    NoTextDetected { bill_id: String },
+    OcrTimeout { bill_id: String },
+    NoReceiptDetected { bill_id: String },
     ReceiptMismatch {
+        bill_id: String,
         computed_sum_cents: i64,
         recognized_total_cents: i64,
+        // Kept for API-shape parity with the pipeline's computed value and
+        // for `Debug`/logging visibility even though the retry page's copy
+        // (spec §4.3.3) only needs the two totals it's derived from.
+        #[allow(dead_code)]
         discrepancy_cents: i64,
     },
     InternalError(String),
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
-    reason: &'static str,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    computed_sum_cents: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    recognized_total_cents: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    discrepancy_cents: Option<i64>,
-}
-
+/// Renders [`PhotoUploadError`] to HTML (spec §4.3.3's retry-photo screen
+/// for every pipeline-level outcome; a generic error page for the
+/// administrative failure modes that shouldn't occur in normal use).
+///
+/// Pipeline outcomes that represent a legitimate, expected UI state (the
+/// host needs to retry the photo) render with `200 OK` — an HTMX
+/// `hx-target="body" hx-swap="outerHTML"` full-page swap only applies on
+/// success by default, and this *is* the successful rendering of the
+/// "please retry" screen, not a transport failure. Administrative errors
+/// (missing auth, unknown bill, oversized upload) keep real non-2xx status
+/// codes, since those aren't states the upload form's own flow produces.
 impl IntoResponse for PhotoUploadError {
     fn into_response(self) -> Response {
-        let (status, reason, message, computed_sum_cents, recognized_total_cents, discrepancy_cents) =
-            match self {
-                PhotoUploadError::NotFound(msg) => {
-                    (StatusCode::NOT_FOUND, "not_found", msg, None, None, None)
-                }
-                PhotoUploadError::Unauthorized => (
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "you don't have host access to this bill".to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-                PhotoUploadError::Conflict(msg) => {
-                    (StatusCode::CONFLICT, "conflict", msg, None, None, None)
-                }
-                PhotoUploadError::BadRequest(msg) => {
-                    (StatusCode::BAD_REQUEST, "bad_request", msg, None, None, None)
-                }
-                PhotoUploadError::ImageUnreadable => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "image_unreadable",
-                    "that photo couldn't be read as an image — try again".to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-                PhotoUploadError::NoTextDetected => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "no_text_detected",
-                    "no text was detected in that photo — try better lighting or a closer shot"
-                        .to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-                PhotoUploadError::OcrTimeout => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "ocr_timeout",
-                    "reading the receipt took too long — please try again".to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-                PhotoUploadError::NoReceiptDetected => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "no_receipt_detected",
-                    "that doesn't look like a receipt — no total could be found".to_string(),
-                    None,
-                    None,
-                    None,
-                ),
-                PhotoUploadError::ReceiptMismatch {
-                    computed_sum_cents,
-                    recognized_total_cents,
-                    discrepancy_cents,
-                } => (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "receipt_mismatch",
-                    format!(
-                        "the items we found add up to {computed_sum_cents} cents, but the \
-                         printed total is {recognized_total_cents} cents — try another photo"
-                    ),
-                    Some(computed_sum_cents),
-                    Some(recognized_total_cents),
-                    Some(discrepancy_cents),
-                ),
-                PhotoUploadError::InternalError(msg) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    msg,
-                    None,
-                    None,
-                    None,
-                ),
-            };
-        (
-            status,
-            Json(ErrorBody {
-                reason,
-                message,
+        match self {
+            PhotoUploadError::NotFound(msg) => (
+                StatusCode::NOT_FOUND,
+                render(ErrorTemplate {
+                    title: "Not found".to_string(),
+                    message: msg,
+                }),
+            )
+                .into_response(),
+            PhotoUploadError::Unauthorized => (
+                StatusCode::UNAUTHORIZED,
+                render(ErrorTemplate {
+                    title: "Not authorized".to_string(),
+                    message: "you don't have host access to this bill".to_string(),
+                }),
+            )
+                .into_response(),
+            PhotoUploadError::Conflict(msg) => (
+                StatusCode::CONFLICT,
+                render(ErrorTemplate {
+                    title: "Can't do that".to_string(),
+                    message: msg,
+                }),
+            )
+                .into_response(),
+            PhotoUploadError::BadRequest(msg) => (
+                StatusCode::BAD_REQUEST,
+                render(ErrorTemplate {
+                    title: "Bad request".to_string(),
+                    message: msg,
+                }),
+            )
+                .into_response(),
+            PhotoUploadError::ImageUnreadable { bill_id } => retry_page(
+                bill_id,
+                "That photo couldn't be read as an image — try again.",
+            ),
+            PhotoUploadError::NoTextDetected { bill_id } => retry_page(
+                bill_id,
+                "No text was detected in that photo — try better lighting or a closer shot.",
+            ),
+            PhotoUploadError::OcrTimeout { bill_id } => {
+                retry_page(bill_id, "Reading the receipt took too long — please try again.")
+            }
+            PhotoUploadError::NoReceiptDetected { bill_id } => retry_page(
+                bill_id,
+                "That doesn't look like a receipt — no total could be found.",
+            ),
+            PhotoUploadError::ReceiptMismatch {
+                bill_id,
                 computed_sum_cents,
                 recognized_total_cents,
-                discrepancy_cents,
-            }),
-        )
-            .into_response()
+                ..
+            } => retry_page(
+                bill_id,
+                &format!(
+                    "The items we found add up to {}, but the printed total is {}. \
+                     Can you try another photo? Good lighting and a flat receipt help a lot.",
+                    templates::fmt_cents(computed_sum_cents),
+                    templates::fmt_cents(recognized_total_cents),
+                ),
+            ),
+            PhotoUploadError::InternalError(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                render(ErrorTemplate {
+                    title: "Something broke".to_string(),
+                    message: msg,
+                }),
+            )
+                .into_response(),
+        }
     }
 }
 
-// ---------------------------------------------------------------------
-// Success response shapes (spec §1.5's `needs_confirmation` fragment
-// fields, §1.7's confidence exposure)
-// ---------------------------------------------------------------------
-
-#[derive(Serialize)]
-struct ItemConfidenceJson {
-    name: String,
-    price_cents: i64,
-    quantity_hint: Option<u32>,
-    confidence: &'static str,
-}
-
-#[derive(Serialize)]
-struct PhotoUploadResponse {
-    status: &'static str,
-    items: Vec<ItemConfidenceJson>,
-    recognized_total_cents: i64,
-    tax_tip_amount_cents: i64,
-    overall_confidence: &'static str,
-    tax_tip_unconfirmed: bool,
-}
-
-fn confidence_label(bucket: ConfidenceBucket) -> &'static str {
-    match bucket {
-        ConfidenceBucket::Low => "low",
-        ConfidenceBucket::High => "high",
-    }
+fn retry_page(bill_id: String, message: &str) -> Response {
+    (
+        StatusCode::OK,
+        render(HostUploadTemplate {
+            bill_id,
+            retry_message: Some(message.to_string()),
+        }),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------
@@ -257,20 +226,28 @@ pub(crate) async fn upload_photo(
         )));
     }
 
-    let outcome = run_pipeline(state.ocr_engine.clone(), photo_bytes).await?;
+    let outcome = run_pipeline(state.ocr_engine.clone(), photo_bytes, &bill_id).await?;
 
     match outcome {
         PipelineOutcome::Success {
             items,
             recognized_total_cents,
             tax_tip_amount_cents,
-            overall_confidence,
-            tax_tip_unconfirmed,
+            overall_confidence: _,
+            tax_tip_unconfirmed: _,
         } => {
+            // Quantity hints fold into the display name (spec §4.3.4's
+            // mockup shows "Sparkling Water x2") since the schema has no
+            // separate `quantity` column (spec §1.9: deliberate
+            // simplification — the parsed price is already the line
+            // total, never multiplied).
             let new_items: Vec<NewItem> = items
                 .iter()
                 .map(|i| NewItem {
-                    name: i.name.clone(),
+                    name: match i.quantity_hint {
+                        Some(q) if q > 1 => format!("{} x{q}", i.name),
+                        _ => i.name.clone(),
+                    },
                     price_cents: i.price_cents,
                 })
                 .collect();
@@ -287,26 +264,14 @@ pub(crate) async fn upload_photo(
             .await
             .map_err(|e| PhotoUploadError::InternalError(e.to_string()))?;
 
-            let response = PhotoUploadResponse {
-                status: "pending_confirmation",
-                items: items
-                    .into_iter()
-                    .map(|i| ItemConfidenceJson {
-                        name: i.name,
-                        price_cents: i.price_cents,
-                        quantity_hint: i.quantity_hint,
-                        confidence: confidence_label(i.confidence),
-                    })
-                    .collect(),
-                recognized_total_cents,
-                tax_tip_amount_cents,
-                overall_confidence: match overall_confidence {
-                    OverallConfidence::High => "high",
-                    OverallConfidence::Low => "low",
-                },
-                tax_tip_unconfirmed,
-            };
-            Ok((StatusCode::OK, Json(response)).into_response())
+            let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None)
+                .await
+                .map_err(|e| PhotoUploadError::InternalError(e.to_string()))?;
+            Ok((
+                StatusCode::OK,
+                render(templates::host_review_page(&bill_id, &bill_state)),
+            )
+                .into_response())
         }
         PipelineOutcome::Mismatch {
             computed_sum_cents,
@@ -317,6 +282,7 @@ pub(crate) async fn upload_photo(
                 .await
                 .map_err(|e| PhotoUploadError::InternalError(e.to_string()))?;
             Err(PhotoUploadError::ReceiptMismatch {
+                bill_id,
                 computed_sum_cents,
                 recognized_total_cents,
                 discrepancy_cents,
@@ -366,6 +332,11 @@ struct PipelineItem {
     name: String,
     price_cents: i64,
     quantity_hint: Option<u32>,
+    // Per-item confidence (spec §1.7) isn't surfaced in the review-screen
+    // UI yet (a v2 enhancement: highlighting likely-wrong rows) — computed
+    // and threaded through regardless, so wiring it into the template
+    // later is a template-only change.
+    #[allow(dead_code)]
     confidence: ConfidenceBucket,
 }
 
@@ -374,7 +345,10 @@ enum PipelineOutcome {
         items: Vec<PipelineItem>,
         recognized_total_cents: i64,
         tax_tip_amount_cents: i64,
+        // Same "not surfaced yet" note as `PipelineItem::confidence`.
+        #[allow(dead_code)]
         overall_confidence: OverallConfidence,
+        #[allow(dead_code)]
         tax_tip_unconfirmed: bool,
     },
     Mismatch {
@@ -387,13 +361,16 @@ enum PipelineOutcome {
 async fn run_pipeline(
     engine: Arc<dyn OcrEngine>,
     photo_bytes: Vec<u8>,
+    bill_id: &str,
 ) -> Result<PipelineOutcome, PhotoUploadError> {
     // Preprocessing is CPU-bound; keep it off the async executor.
     let preprocessed = tokio::task::spawn_blocking(move || preprocess::preprocess(&photo_bytes))
         .await
         .map_err(|e| PhotoUploadError::InternalError(format!("preprocessing task panicked: {e}")))?
         .map_err(|e| match e {
-            PreprocessError::Decode(_) => PhotoUploadError::ImageUnreadable,
+            PreprocessError::Decode(_) => PhotoUploadError::ImageUnreadable {
+                bill_id: bill_id.to_string(),
+            },
             PreprocessError::Encode(msg) => PhotoUploadError::InternalError(msg),
         })?;
 
@@ -412,23 +389,33 @@ async fn run_pipeline(
                 "OCR task panicked: {join_err}"
             )));
         }
-        Err(_elapsed) => return Err(PhotoUploadError::OcrTimeout),
+        Err(_elapsed) => {
+            return Err(PhotoUploadError::OcrTimeout {
+                bill_id: bill_id.to_string(),
+            })
+        }
     };
 
     if words.is_empty() {
-        return Err(PhotoUploadError::NoTextDetected);
+        return Err(PhotoUploadError::NoTextDetected {
+            bill_id: bill_id.to_string(),
+        });
     }
 
     let lines = parser::parse_lines(&words);
 
-    let total = parser::identify_total(&lines).ok_or(PhotoUploadError::NoReceiptDetected)?;
+    let total = parser::identify_total(&lines).ok_or_else(|| PhotoUploadError::NoReceiptDetected {
+        bill_id: bill_id.to_string(),
+    })?;
 
     let item_lines: Vec<_> = lines
         .iter()
         .filter(|l| l.category == LineCategory::Item)
         .collect();
     if item_lines.is_empty() {
-        return Err(PhotoUploadError::NoReceiptDetected);
+        return Err(PhotoUploadError::NoReceiptDetected {
+            bill_id: bill_id.to_string(),
+        });
     }
 
     let items_sum_cents: i64 = item_lines.iter().filter_map(|l| l.price_cents).sum();

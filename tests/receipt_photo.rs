@@ -1,10 +1,11 @@
 //! HTTP-level integration test for the Receipt Recognizer's
 //! `POST /b/{id}/photo` endpoint (spec §1.5), exercising the *real*
 //! pipeline end to end: preprocess -> Tesseract OCR -> parse -> reconcile
-//! -> item persistence -> bill status transition. Unlike
-//! `tests/bill_lifecycle.rs` (which bridges the OCR gap with a direct
-//! `add_items` call + `force_status`), this test drives the actual
-//! `upload_photo` handler with a synthetically rendered receipt-like PNG.
+//! -> item persistence -> bill status transition -> HTML rendering (spec
+//! §4.3.3/§4.3.4). Unlike `tests/bill_lifecycle.rs` (which bridges the OCR
+//! gap with a direct `add_items` call + `force_status`), this test drives
+//! the actual `upload_photo` handler with a synthetically rendered
+//! receipt-like PNG.
 //!
 //! The synthetic image is rendered at test time via `imageproc`'s text
 //! drawing against a macOS system font (`/System/Library/Fonts/
@@ -46,8 +47,9 @@ async fn test_app() -> (axum::Router, sqlx::SqlitePool) {
     (router(state), pool)
 }
 
-async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
-    response.into_body().collect().await.unwrap().to_bytes().to_vec()
+async fn body_text(response: axum::response::Response) -> String {
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    String::from_utf8(bytes.to_vec()).unwrap()
 }
 
 fn cookie_name_value(set_cookie_header: &str) -> String {
@@ -110,6 +112,9 @@ fn multipart_body(boundary: &str, field_name: &str, filename: &str, bytes: &[u8]
 }
 
 /// Creates a bill via `POST /bills`, returning `(bill_id, host_cookie)`.
+/// The route now issues a `303` redirect to `/b/{id}/host` (spec §4.3.1)
+/// rather than a body containing the bill id, so the id is pulled off the
+/// `Location` header instead.
 async fn create_bill(app: &axum::Router) -> (String, String) {
     let resp = app
         .clone()
@@ -122,7 +127,7 @@ async fn create_bill(app: &axum::Router) -> (String, String) {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
     let host_cookie = cookie_name_value(
         resp.headers()
             .get(axum::http::header::SET_COOKIE)
@@ -130,9 +135,18 @@ async fn create_bill(app: &axum::Router) -> (String, String) {
             .to_str()
             .unwrap(),
     );
-    let body = String::from_utf8(body_bytes(resp).await).unwrap();
-    let start = body.find("bill_id=").unwrap() + "bill_id=".len();
-    let bill_id = body[start..][..body[start..].find("</p>").unwrap()].to_string();
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap();
+    let bill_id = location
+        .strip_prefix("/b/")
+        .unwrap()
+        .strip_suffix("/host")
+        .unwrap()
+        .to_string();
     (bill_id, host_cookie)
 }
 
@@ -175,43 +189,34 @@ async fn full_pipeline_against_a_synthetic_receipt_image() {
         .unwrap();
 
     let status = resp.status();
-    let raw_body = body_bytes(resp).await;
-    let json: serde_json::Value = serde_json::from_slice(&raw_body).unwrap_or_else(|e| {
-        panic!(
-            "expected JSON response, got status={status} body={:?}: {e}",
-            String::from_utf8_lossy(&raw_body)
-        )
-    });
+    let html = body_text(resp).await;
 
     // OCR accuracy on a synthetically rendered image is not guaranteed to
     // be perfect, so reconciliation might land on either outcome. What
     // this test actually verifies is that the pipeline runs end to end
     // without a *pipeline-level* failure (image_unreadable/no_text_detected/
     // no_receipt_detected/internal_error/ocr_timeout would all indicate a
-    // real bug, not just OCR imprecision).
+    // real bug, not just OCR imprecision) — both outcomes render `200 OK`
+    // HTML (the review screen on success, the retry screen on mismatch),
+    // distinguished by which heading is present.
     let bill_status_after = sharepay::bill::get_status(&pool, &bill_id).await.unwrap();
-    match status {
-        StatusCode::OK => {
-            assert_eq!(json["status"], "pending_confirmation");
-            assert_eq!(bill_status_after.as_deref(), Some("pending_confirmation"));
-            let items = json["items"].as_array().expect("items array");
-            assert!(!items.is_empty(), "expected at least one parsed item");
-            println!(
-                "full_pipeline_against_a_synthetic_receipt_image: OCR succeeded, {} item(s) parsed",
-                items.len()
-            );
-        }
-        StatusCode::UNPROCESSABLE_ENTITY if json["reason"] == "receipt_mismatch" => {
-            assert_eq!(bill_status_after.as_deref(), Some("awaiting_photo_retry"));
-            println!(
-                "full_pipeline_against_a_synthetic_receipt_image: OCR ran but reconciliation \
-                 mismatched (acceptable — synthetic-image OCR accuracy isn't guaranteed): {json:?}"
-            );
-        }
-        other => panic!(
-            "unexpected pipeline-level failure (status={other}): {json:?} — this indicates a \
-             bug in the pipeline wiring, not just OCR imprecision"
-        ),
+    assert_eq!(status, StatusCode::OK, "unexpected status; body={html}");
+    if html.contains("Does this look right?") {
+        assert_eq!(bill_status_after.as_deref(), Some("pending_confirmation"));
+        println!(
+            "full_pipeline_against_a_synthetic_receipt_image: OCR succeeded, review screen rendered"
+        );
+    } else if html.contains("We couldn't quite read that receipt") {
+        assert_eq!(bill_status_after.as_deref(), Some("awaiting_photo_retry"));
+        println!(
+            "full_pipeline_against_a_synthetic_receipt_image: OCR ran but reconciliation \
+             mismatched (acceptable — synthetic-image OCR accuracy isn't guaranteed)"
+        );
+    } else {
+        panic!(
+            "unexpected pipeline-level failure — neither the review nor retry screen rendered: \
+             {html}"
+        );
     }
 }
 
@@ -240,9 +245,12 @@ async fn upload_unreadable_bytes_is_rejected_and_bill_state_persists() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert_eq!(json["reason"], "image_unreadable");
+    // The pipeline-level failure renders the retry screen with 200 OK
+    // (spec §4.3.3) — it's a legitimate UI state, not a transport error.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = body_text(resp).await;
+    assert!(html.contains("We couldn"));
+    assert!(html.contains("read as an image"));
 
     // The bill (and, transitively, any participants -- none exist yet
     // pre-open) persists untouched: still pending_ocr, no bill_id/QR

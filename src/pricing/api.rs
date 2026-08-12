@@ -183,6 +183,77 @@ pub async fn add_items(
     Ok(ids)
 }
 
+/// Updates an existing item's name/price in place. Host-only (auth enforced
+/// by the caller), permitted only while the bill is in any pre-open status
+/// ([`PRE_OPEN_STATUSES`]) — mirrors [`add_items`]'s status gate. Used by
+/// the Mobile Client's review/edit screen (spec §4.3.4) at Confirm time,
+/// when the host's in-place edits to the always-editable name/price inputs
+/// are applied. Returns `Err(NotFound)` if `item_id` doesn't belong to
+/// `bill_id`.
+pub async fn update_item(
+    pool: &SqlitePool,
+    bill_id: &str,
+    item_id: i64,
+    name: &str,
+    price_cents: i64,
+) -> Result<(), Error> {
+    let mut tx = pool.begin().await?;
+
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM bills WHERE id = ?")
+        .bind(bill_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let status = status.ok_or(Error::NotFound)?;
+    if !is_pre_open(&status) {
+        return Err(Error::BillAlreadyOpen);
+    }
+
+    let result = sqlx::query("UPDATE items SET name = ?, price = ? WHERE id = ? AND bill_id = ?")
+        .bind(name)
+        .bind(price_cents)
+        .bind(item_id)
+        .bind(bill_id)
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Removes an item from a bill. Host-only (auth enforced by the caller),
+/// permitted only while the bill is in any pre-open status
+/// ([`PRE_OPEN_STATUSES`]) — mirrors [`add_items`]'s status gate. No
+/// `item_markers` can exist yet (marking only happens once `open`, when
+/// items are already frozen), so no cascade concerns in practice, though
+/// the schema's `ON DELETE CASCADE` covers it regardless (spec §3.6).
+pub async fn delete_item(pool: &SqlitePool, bill_id: &str, item_id: i64) -> Result<(), Error> {
+    let mut tx = pool.begin().await?;
+
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM bills WHERE id = ?")
+        .bind(bill_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let status = status.ok_or(Error::NotFound)?;
+    if !is_pre_open(&status) {
+        return Err(Error::BillAlreadyOpen);
+    }
+
+    let result = sqlx::query("DELETE FROM items WHERE id = ? AND bill_id = ?")
+        .bind(item_id)
+        .bind(bill_id)
+        .execute(&mut *tx)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Any pre-open status -> `open` (spec §2.5: the real-world transition is
 /// `pending_confirmation -> open` once the host confirms items, but this
 /// function accepts any pre-open status as a defensive measure — the
@@ -802,5 +873,73 @@ mod tests {
         )
         .await;
         assert!(matches!(result, Err(PriceDistributorError::BillAlreadyOpen)));
+    }
+
+    #[tokio::test]
+    async fn update_item_edits_name_and_price_while_pre_open_but_not_after() {
+        let pool = test_pool().await;
+        let bill_id = create_bill(&pool, "bill-update-item", "hash").await.unwrap();
+        let item_id = add_items(
+            &pool,
+            &bill_id,
+            vec![NewItem {
+                name: "Burger".into(),
+                price_cents: 1200,
+            }],
+        )
+        .await
+        .unwrap()[0];
+
+        update_item(&pool, &bill_id, item_id, "Cheeseburger", 1350)
+            .await
+            .unwrap();
+
+        let state = get_bill_state(&pool, &bill_id, None).await.unwrap();
+        let item = state.items.iter().find(|i| i.id == item_id).unwrap();
+        assert_eq!(item.name, "Cheeseburger");
+        assert_eq!(item.price_cents, 1350);
+
+        // Unknown item id -> NotFound.
+        let missing = update_item(&pool, &bill_id, item_id + 999, "X", 100).await;
+        assert!(matches!(missing, Err(PriceDistributorError::NotFound)));
+
+        open_bill(&pool, &bill_id).await.unwrap();
+        let locked = update_item(&pool, &bill_id, item_id, "Too late", 1).await;
+        assert!(matches!(locked, Err(PriceDistributorError::BillAlreadyOpen)));
+    }
+
+    #[tokio::test]
+    async fn delete_item_removes_row_while_pre_open_but_not_after() {
+        let pool = test_pool().await;
+        let bill_id = create_bill(&pool, "bill-delete-item", "hash").await.unwrap();
+        let item_ids = add_items(
+            &pool,
+            &bill_id,
+            vec![
+                NewItem {
+                    name: "Burger".into(),
+                    price_cents: 1200,
+                },
+                NewItem {
+                    name: "Fries".into(),
+                    price_cents: 500,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+        let (burger_id, fries_id) = (item_ids[0], item_ids[1]);
+
+        delete_item(&pool, &bill_id, burger_id).await.unwrap();
+        let state = get_bill_state(&pool, &bill_id, None).await.unwrap();
+        assert_eq!(state.items.len(), 1);
+        assert_eq!(state.items[0].id, fries_id);
+
+        let missing = delete_item(&pool, &bill_id, burger_id).await;
+        assert!(matches!(missing, Err(PriceDistributorError::NotFound)));
+
+        open_bill(&pool, &bill_id).await.unwrap();
+        let locked = delete_item(&pool, &bill_id, fries_id).await;
+        assert!(matches!(locked, Err(PriceDistributorError::BillAlreadyOpen)));
     }
 }

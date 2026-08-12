@@ -1,0 +1,8 @@
+{% extends "shell.html" %}
+{% block content %}
+<h1>SharePay</h1>
+<p>Split a restaurant bill with your friends — no accounts, just a photo of the receipt.</p>
+<form method="post" action="/bills">
+  <button type="submit" class="btn-primary btn-big">Start a new bill</button>
+</form>
+{% endblock %}

@@ -1,0 +1,5 @@
+{% if count == 0 %}
+<p>👥 Nobody has joined yet — share the link above.</p>
+{% else %}
+<p>👥 {{ count }} {% if count == 1 %}person has{% else %}people have{% endif %} joined &nbsp; {% for n in names %}• {{ n }} {% endfor %}</p>
+{% endif %}

@@ -20,6 +20,8 @@ image = "0.25"
 imageproc = "0.25"
 kamadak-exif = "0.6"
 regex = "1"
+askama = "0.16.0"
+tower-http = { version = "0.7.0", features = ["fs"] }
 
 [dev-dependencies]
 http-body-util = "0.1.4"

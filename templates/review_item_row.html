@@ -1,0 +1,5 @@
+<tr id="item-row-{{ id }}">
+  <td><input type="text" name="item_name_{{ id }}" value="{{ name }}" maxlength="200" required></td>
+  <td><input type="number" inputmode="decimal" step="0.01" min="0" name="item_price_{{ id }}" value="{{ price_input_value }}"></td>
+  <td><button type="button" class="delete-btn" aria-label="Delete item" hx-delete="/b/{{ bill_id }}/items/{{ id }}" hx-target="closest tr" hx-swap="outerHTML swap:0s">🗑</button></td>
+</tr>

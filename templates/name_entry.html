@@ -1,0 +1,9 @@
+{% extends "shell.html" %}
+{% block content %}
+<h1>What's your name?</h1>
+{% if let Some(err) = error %}<p class="error">{{ err }}</p>{% endif %}
+<form method="post" action="/b/{{ bill_id }}/join" hx-post="/b/{{ bill_id }}/join" hx-target="body" hx-swap="outerHTML">
+  <input type="text" name="display_name" autofocus required maxlength="40" placeholder="e.g. Alex" autocomplete="name" value="{{ name_value }}">
+  <button type="submit" class="btn-primary">Join</button>
+</form>
+{% endblock %}
