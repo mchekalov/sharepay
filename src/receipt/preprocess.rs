@@ -29,11 +29,13 @@ pub enum PreprocessError {
     Encode(String),
 }
 
-/// Runs the full preprocessing pipeline (spec §1.2, steps 1-6) on raw
-/// uploaded photo bytes, returning PNG-encoded bytes of the binarized,
-/// upright, bounded-size grayscale image, ready to hand to
-/// [`crate::receipt::OcrEngine::recognize_words`].
-pub fn preprocess(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
+/// Steps 1-3 (decode/validate, EXIF+OSD orientation correction, downscale)
+/// — the genuinely engine-agnostic part of preprocessing: every
+/// [`crate::receipt::ReceiptEngine`] wants an upright, bounded-size image,
+/// regardless of what it does with it next. Shared by [`preprocess`]
+/// (which continues on into Tesseract-specific grayscale/binarization) and
+/// [`preprocess_light`] (which stops here, keeping full color).
+fn decode_orient_downscale(raw_bytes: &[u8]) -> Result<DynamicImage, PreprocessError> {
     // 1. Decode + validate.
     let img = image::load_from_memory(raw_bytes)?;
 
@@ -55,8 +57,13 @@ pub fn preprocess(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
     let img = correct_osd_orientation(img);
 
     // 3. Downscale to the bounded long edge (never upscale).
-    let img = downscale(img);
+    Ok(downscale(img))
+}
 
+/// Finishes preprocessing a decoded image with the Tesseract-specific
+/// steps (spec §1.2, steps 4-6: grayscale, contrast normalization, Otsu
+/// binarization), returning PNG-encoded bytes.
+fn binarize_and_encode(img: DynamicImage) -> Result<Vec<u8>, PreprocessError> {
     // 4. Grayscale.
     let gray = img.to_luma8();
 
@@ -88,6 +95,48 @@ pub fn preprocess(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
         .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
         .map_err(|e| PreprocessError::Encode(e.to_string()))?;
     Ok(out)
+}
+
+/// Runs the full preprocessing pipeline (spec §1.2, steps 1-6) on raw
+/// uploaded photo bytes, returning PNG-encoded bytes of the binarized,
+/// upright, bounded-size grayscale image, ready to hand to
+/// [`crate::receipt::OcrEngine::recognize_words`]. Used by
+/// [`crate::receipt::receipt_engine::TesseractReceiptEngine`] internally
+/// (via [`finish_binarization`]) and directly by `examples/receipt_debug.rs`.
+pub fn preprocess(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
+    let img = decode_orient_downscale(raw_bytes)?;
+    binarize_and_encode(img)
+}
+
+/// Steps 1-3 only (decode/validate, orientation correction, downscale) —
+/// no grayscale/contrast/binarization. PNG-encoded, full color. Used ahead
+/// of a vision-model-based [`crate::receipt::ReceiptEngine`] (e.g.
+/// [`crate::receipt::claude_engine::ClaudeReceiptEngine`]), which reads a
+/// full-color photo more accurately than Tesseract's pure-black-and-white-
+/// tuned output — verified empirically: binarization measurably degraded a
+/// vision model's extraction quality on real receipt photos (garbled text,
+/// lost the total/subtotal distinction). [`crate::routes::receipt`] calls
+/// this once per upload; [`TesseractReceiptEngine`] finishes its own
+/// Tesseract-specific steps on top via [`finish_binarization`], so the two
+/// engines share the genuinely engine-agnostic prep and diverge only where
+/// their needs actually differ.
+///
+/// [`TesseractReceiptEngine`]: crate::receipt::receipt_engine::TesseractReceiptEngine
+pub fn preprocess_light(raw_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
+    let img = decode_orient_downscale(raw_bytes)?;
+    let mut out = Vec::new();
+    img.write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+        .map_err(|e| PreprocessError::Encode(e.to_string()))?;
+    Ok(out)
+}
+
+/// Finishes the Tesseract-specific steps (grayscale, contrast
+/// normalization, Otsu binarization) on top of [`preprocess_light`]'s
+/// output. Kept as a separate step (rather than folded back into
+/// `preprocess_light`) so a vision-model engine never pays for it.
+pub fn finish_binarization(light_png_bytes: &[u8]) -> Result<Vec<u8>, PreprocessError> {
+    let img = image::load_from_memory(light_png_bytes)?;
+    binarize_and_encode(img)
 }
 
 /// EXIF `Orientation` tag values 1-8 (TIFF/EXIF spec), applied as the
@@ -287,6 +336,35 @@ mod tests {
         let out = preprocess(&small).unwrap();
         let (w, h) = image::load_from_memory(&out).unwrap().dimensions();
         assert_eq!((w, h), (100, 80), "small images must not be upscaled");
+    }
+
+    #[test]
+    fn preprocess_light_keeps_color_and_is_not_binarized() {
+        let input = make_test_png(200, 200);
+        let output = preprocess_light(&input).unwrap();
+        let decoded = image::load_from_memory(&output).unwrap().to_luma8();
+        // The synthetic input is 40/220 luma, not 0/255 — preprocess_light
+        // must not have binarized it (unlike `preprocess`, tested below).
+        assert!(
+            decoded.pixels().any(|p| p.0[0] != 0 && p.0[0] != 255),
+            "preprocess_light should not binarize — pixels should retain non-extreme values"
+        );
+    }
+
+    #[test]
+    fn finish_binarization_on_top_of_preprocess_light_matches_preprocess_exactly() {
+        // Proves the preprocess/preprocess_light+finish_binarization split
+        // is behavior-preserving for the Tesseract path: same input, same
+        // final binarized pixels, regardless of which route produced them.
+        let input = make_test_png(300, 200);
+        let via_preprocess = preprocess(&input).unwrap();
+        let light = preprocess_light(&input).unwrap();
+        let via_split = finish_binarization(&light).unwrap();
+
+        let a = image::load_from_memory(&via_preprocess).unwrap().to_luma8();
+        let b = image::load_from_memory(&via_split).unwrap().to_luma8();
+        assert_eq!(a.dimensions(), b.dimensions());
+        assert_eq!(a.into_raw(), b.into_raw());
     }
 
     #[test]

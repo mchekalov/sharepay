@@ -29,7 +29,7 @@ use http_body_util::BodyExt;
 use image::{DynamicImage, ImageFormat, Rgb, RgbImage};
 use imageproc::drawing::draw_text_mut;
 use sharepay::db::{init_pool, DbConfig};
-use sharepay::receipt::TesseractEngine;
+use sharepay::receipt::TesseractReceiptEngine;
 use sharepay::routes::{router, AppState};
 use tower::ServiceExt;
 
@@ -37,12 +37,13 @@ const TEST_FONT_PATH: &str = "/System/Library/Fonts/Supplemental/Arial.ttf";
 
 async fn test_app() -> (axum::Router, sqlx::SqlitePool) {
     let pool = init_pool(&DbConfig::in_memory()).await.unwrap();
-    let ocr_engine: Arc<dyn sharepay::receipt::OcrEngine> =
-        Arc::new(TesseractEngine::new(None, "eng").expect("Tesseract engine should initialize"));
+    let receipt_engine: Arc<dyn sharepay::receipt::ReceiptEngine> =
+        Arc::new(TesseractReceiptEngine::new(None, "eng").expect("Tesseract engine should initialize"));
     let state = AppState {
         pool: pool.clone(),
         base_url: "https://sharepay.example".to_string(),
-        ocr_engine,
+        receipt_engine,
+        currency: sharepay::config::Currency::Usd,
     };
     (router(state), pool)
 }

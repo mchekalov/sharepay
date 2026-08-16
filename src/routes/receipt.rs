@@ -40,12 +40,13 @@ use axum::Router;
 use axum_extra::extract::cookie::CookieJar;
 
 use crate::bill;
+use crate::config::Currency;
 use crate::host_auth;
 use crate::pricing::api::{self as pricing_api, NewItem};
-use crate::receipt::parser::{self, ConfidenceBucket, LineCategory};
+use crate::receipt::parser::ConfidenceBucket;
 use crate::receipt::preprocess::{self, PreprocessError};
 use crate::receipt::reconcile::{self, OverallConfidence, ReconcileInput, ReconcileOutcome};
-use crate::receipt::{OcrEngine, OcrError};
+use crate::receipt::{OcrError, ReceiptEngine};
 use crate::routes::bill::AppState;
 use crate::templates::{self, render, ErrorTemplate, HostUploadTemplate};
 
@@ -86,6 +87,11 @@ pub(crate) enum PhotoUploadError {
         // (spec §4.3.3) only needs the two totals it's derived from.
         #[allow(dead_code)]
         discrepancy_cents: i64,
+        /// Threaded through from `AppState::currency` at construction time
+        /// — `into_response()` has no `AppState` access (it's an
+        /// `IntoResponse` impl, not a handler), so this can't be read at
+        /// render time the way route handlers read `state.currency`.
+        currency: Currency,
     },
     InternalError(String),
 }
@@ -155,14 +161,15 @@ impl IntoResponse for PhotoUploadError {
                 bill_id,
                 computed_sum_cents,
                 recognized_total_cents,
+                currency,
                 ..
             } => retry_page(
                 bill_id,
                 &format!(
                     "The items we found add up to {}, but the printed total is {}. \
                      Can you try another photo? Good lighting and a flat receipt help a lot.",
-                    templates::fmt_cents(computed_sum_cents),
-                    templates::fmt_cents(recognized_total_cents),
+                    templates::fmt_cents(computed_sum_cents, currency),
+                    templates::fmt_cents(recognized_total_cents, currency),
                 ),
             ),
             PhotoUploadError::InternalError(msg) => (
@@ -226,7 +233,7 @@ pub(crate) async fn upload_photo(
         )));
     }
 
-    let outcome = run_pipeline(state.ocr_engine.clone(), photo_bytes, &bill_id).await?;
+    let outcome = run_pipeline(state.receipt_engine.clone(), photo_bytes, &bill_id).await?;
 
     match outcome {
         PipelineOutcome::Success {
@@ -269,7 +276,7 @@ pub(crate) async fn upload_photo(
                 .map_err(|e| PhotoUploadError::InternalError(e.to_string()))?;
             Ok((
                 StatusCode::OK,
-                render(templates::host_review_page(&bill_id, &bill_state)),
+                render(templates::host_review_page(&bill_id, &bill_state, state.currency)),
             )
                 .into_response())
         }
@@ -286,6 +293,7 @@ pub(crate) async fn upload_photo(
                 computed_sum_cents,
                 recognized_total_cents,
                 discrepancy_cents,
+                currency: state.currency,
             })
         }
     }
@@ -335,9 +343,10 @@ struct PipelineItem {
     // Per-item confidence (spec §1.7) isn't surfaced in the review-screen
     // UI yet (a v2 enhancement: highlighting likely-wrong rows) — computed
     // and threaded through regardless, so wiring it into the template
-    // later is a template-only change.
+    // later is a template-only change. `None` for engines with no
+    // per-item confidence signal (e.g. Claude).
     #[allow(dead_code)]
-    confidence: ConfidenceBucket,
+    confidence: Option<ConfidenceBucket>,
 }
 
 enum PipelineOutcome {
@@ -359,12 +368,16 @@ enum PipelineOutcome {
 }
 
 async fn run_pipeline(
-    engine: Arc<dyn OcrEngine>,
+    engine: Arc<dyn ReceiptEngine>,
     photo_bytes: Vec<u8>,
     bill_id: &str,
 ) -> Result<PipelineOutcome, PhotoUploadError> {
-    // Preprocessing is CPU-bound; keep it off the async executor.
-    let preprocessed = tokio::task::spawn_blocking(move || preprocess::preprocess(&photo_bytes))
+    // Preprocessing is CPU-bound; keep it off the async executor. Only the
+    // engine-agnostic "light" steps (decode, orient, downscale, still
+    // color) happen here — engine-specific finishing (e.g. Tesseract's
+    // grayscale/binarization) is each `ReceiptEngine` impl's own job, so a
+    // vision-model engine isn't handed a Tesseract-tuned binarized image.
+    let preprocessed = tokio::task::spawn_blocking(move || preprocess::preprocess_light(&photo_bytes))
         .await
         .map_err(|e| PhotoUploadError::InternalError(format!("preprocessing task panicked: {e}")))?
         .map_err(|e| match e {
@@ -374,14 +387,23 @@ async fn run_pipeline(
             PreprocessError::Encode(msg) => PhotoUploadError::InternalError(msg),
         })?;
 
-    // OCR is CPU-bound and potentially slow; run it blocking, with an
-    // overall timeout budget (spec §1.6).
-    let ocr_call = tokio::task::spawn_blocking(move || engine.recognize_words(&preprocessed));
-    let words = match tokio::time::timeout(OCR_TIMEOUT, ocr_call).await {
-        Ok(Ok(Ok(words))) => words,
-        Ok(Ok(Err(OcrError::Init(msg))))
-        | Ok(Ok(Err(OcrError::ImageLoad(msg))))
-        | Ok(Ok(Err(OcrError::InvalidOutput(msg)))) => {
+    // Recognition is potentially slow (CPU-bound for Tesseract, network-bound
+    // for an API engine); run it blocking, with an overall timeout budget
+    // (spec §1.6).
+    let ocr_call = tokio::task::spawn_blocking(move || engine.recognize_receipt(&preprocessed));
+    let receipt = match tokio::time::timeout(OCR_TIMEOUT, ocr_call).await {
+        Ok(Ok(Ok(receipt))) => receipt,
+        Ok(Ok(Err(OcrError::NoTextDetected))) => {
+            return Err(PhotoUploadError::NoTextDetected {
+                bill_id: bill_id.to_string(),
+            });
+        }
+        Ok(Ok(Err(
+            OcrError::Init(msg)
+            | OcrError::ImageLoad(msg)
+            | OcrError::InvalidOutput(msg)
+            | OcrError::RequestFailed(msg),
+        ))) => {
             return Err(PhotoUploadError::InternalError(msg));
         }
         Ok(Err(join_err)) => {
@@ -396,44 +418,24 @@ async fn run_pipeline(
         }
     };
 
-    if words.is_empty() {
-        return Err(PhotoUploadError::NoTextDetected {
-            bill_id: bill_id.to_string(),
-        });
-    }
-
-    let lines = parser::parse_lines(&words);
-
-    let total = parser::identify_total(&lines).ok_or_else(|| PhotoUploadError::NoReceiptDetected {
-        bill_id: bill_id.to_string(),
-    })?;
-
-    let item_lines: Vec<_> = lines
-        .iter()
-        .filter(|l| l.category == LineCategory::Item)
-        .collect();
-    if item_lines.is_empty() {
+    if receipt.items.is_empty() {
         return Err(PhotoUploadError::NoReceiptDetected {
             bill_id: bill_id.to_string(),
         });
     }
 
-    let items_sum_cents: i64 = item_lines.iter().filter_map(|l| l.price_cents).sum();
-    let subtotal_cents = lines
-        .iter()
-        .find(|l| l.category == LineCategory::Subtotal)
-        .and_then(|l| l.price_cents);
-    let tax_line_cents = lines
-        .iter()
-        .find(|l| matches!(l.category, LineCategory::Tax | LineCategory::TipService))
-        .and_then(|l| l.price_cents);
+    let total_cents = receipt.total_cents.ok_or_else(|| PhotoUploadError::NoReceiptDetected {
+        bill_id: bill_id.to_string(),
+    })?;
+
+    let items_sum_cents: i64 = receipt.items.iter().map(|i| i.price_cents).sum();
 
     let reconcile_input = ReconcileInput {
         items_sum_cents,
-        num_items: item_lines.len(),
-        subtotal_cents,
-        tax_line_cents,
-        total_cents: total.price_cents,
+        num_items: receipt.items.len(),
+        subtotal_cents: receipt.subtotal_cents,
+        tax_line_cents: receipt.tax_cents,
+        total_cents,
     };
 
     match reconcile::reconcile(&reconcile_input) {
@@ -442,7 +444,7 @@ async fn run_pipeline(
             discrepancy_cents,
         } => Ok(PipelineOutcome::Mismatch {
             computed_sum_cents,
-            recognized_total_cents: total.price_cents,
+            recognized_total_cents: total_cents,
             discrepancy_cents,
         }),
         ReconcileOutcome::Success {
@@ -450,22 +452,19 @@ async fn run_pipeline(
             overall_confidence,
             tax_tip_unconfirmed,
         } => {
-            let items = item_lines
+            let items = receipt
+                .items
                 .into_iter()
-                .filter_map(|l| {
-                    let price_cents = l.price_cents?;
-                    let name = l.name.clone().unwrap_or_default();
-                    Some(PipelineItem {
-                        name,
-                        price_cents,
-                        quantity_hint: l.quantity_hint,
-                        confidence: parser::confidence_bucket(l.mean_confidence),
-                    })
+                .map(|i| PipelineItem {
+                    name: i.name,
+                    price_cents: i.price_cents,
+                    quantity_hint: i.quantity_hint,
+                    confidence: i.confidence,
                 })
                 .collect();
             Ok(PipelineOutcome::Success {
                 items,
-                recognized_total_cents: total.price_cents,
+                recognized_total_cents: total_cents,
                 tax_tip_amount_cents,
                 overall_confidence,
                 tax_tip_unconfirmed,

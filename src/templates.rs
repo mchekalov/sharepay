@@ -9,15 +9,20 @@
 use askama::Template;
 use axum::response::Html;
 
+use crate::config::Currency;
 use crate::pricing::api::BillState;
 
-/// Formats integer cents as a dollar string, e.g. `1234` -> `"$12.34"`.
-/// Never negative in practice (all amounts in this app are non-negative),
-/// but handles the sign defensively rather than panicking.
-pub fn fmt_cents(cents: i64) -> String {
+/// Formats integer cents as a money string in `currency`, e.g. `1234` ->
+/// `"$12.34"` (USD) or `"12.34 ₸"` (KZT). Never negative in practice (all
+/// amounts in this app are non-negative), but handles the sign defensively
+/// rather than panicking.
+pub fn fmt_cents(cents: i64, currency: Currency) -> String {
     let sign = if cents < 0 { "-" } else { "" };
     let abs = cents.unsigned_abs();
-    format!("{sign}${}.{:02}", abs / 100, abs % 100)
+    match currency {
+        Currency::Usd => format!("{sign}${}.{:02}", abs / 100, abs % 100),
+        Currency::Kzt => format!("{sign}{}.{:02} ₸", abs / 100, abs % 100),
+    }
 }
 
 /// Formats integer cents as a bare decimal string suitable for a
@@ -91,14 +96,14 @@ pub struct HostReviewTemplate {
 
 /// Builds the review screen's totals footer from the bill's current items
 /// + receipt_total/tax_tip_amount (spec §4.3.4's reconciliation display).
-pub fn totals_footer(state: &BillState, oob: bool) -> String {
+pub fn totals_footer(state: &BillState, oob: bool, currency: Currency) -> String {
     let items_subtotal: i64 = state.items.iter().map(|i| i.price_cents).sum();
     let receipt_total = state.receipt_total.unwrap_or(items_subtotal + state.tax_tip_amount);
     let reconciled = items_subtotal + state.tax_tip_amount == receipt_total;
     render(TotalsFooterTemplate {
-        items_subtotal_display: fmt_cents(items_subtotal),
-        tax_tip_display: fmt_cents(state.tax_tip_amount),
-        receipt_total_display: fmt_cents(receipt_total),
+        items_subtotal_display: fmt_cents(items_subtotal, currency),
+        tax_tip_display: fmt_cents(state.tax_tip_amount, currency),
+        receipt_total_display: fmt_cents(receipt_total, currency),
         reconciled,
         oob,
     })
@@ -117,7 +122,7 @@ pub fn review_row(bill_id: &str, id: i64, name: &str, price_cents: i64) -> Strin
 }
 
 /// Builds the full host review/edit page from the bill's current state.
-pub fn host_review_page(bill_id: &str, state: &BillState) -> HostReviewTemplate {
+pub fn host_review_page(bill_id: &str, state: &BillState, currency: Currency) -> HostReviewTemplate {
     let item_rows = state
         .items
         .iter()
@@ -126,7 +131,7 @@ pub fn host_review_page(bill_id: &str, state: &BillState) -> HostReviewTemplate 
     HostReviewTemplate {
         bill_id: bill_id.to_string(),
         item_rows,
-        totals_footer: totals_footer(state, false),
+        totals_footer: totals_footer(state, false, currency),
     }
 }
 
@@ -201,7 +206,12 @@ pub struct ErrorTemplate {
 /// render, the polling endpoint, and the mark/unmark responses.
 /// `requesting_participant_id` scopes "You" labeling and `is_marked_by_me`;
 /// pass `None` for the host's closed-bill view.
-pub fn bill_fragment(bill_id: &str, state: &BillState, me: Option<&str>) -> BillFragmentTemplate {
+pub fn bill_fragment(
+    bill_id: &str,
+    state: &BillState,
+    me: Option<&str>,
+    currency: Currency,
+) -> BillFragmentTemplate {
     let items: Vec<FragmentItemRow> = state
         .items
         .iter()
@@ -220,7 +230,7 @@ pub fn bill_fragment(bill_id: &str, state: &BillState, me: Option<&str>) -> Bill
             FragmentItemRow {
                 id: item.id,
                 name: item.name.clone(),
-                price_display: fmt_cents(item.price_cents),
+                price_display: fmt_cents(item.price_cents, currency),
                 marked: item.is_marked_by_me,
                 markers_display: names.join(", "),
             }
@@ -228,12 +238,12 @@ pub fn bill_fragment(bill_id: &str, state: &BillState, me: Option<&str>) -> Bill
         .collect();
 
     let unassigned_display = if state.unassigned_amount > 0 {
-        Some(fmt_cents(state.unassigned_amount))
+        Some(fmt_cents(state.unassigned_amount, currency))
     } else {
         None
     };
 
-    let my_total_display = fmt_cents(state.my_total);
+    let my_total_display = fmt_cents(state.my_total, currency);
     let copy_text = format!("You owe {my_total_display} for your SharePay bill");
 
     BillFragmentTemplate {
@@ -248,13 +258,18 @@ pub fn bill_fragment(bill_id: &str, state: &BillState, me: Option<&str>) -> Bill
 
 /// Wraps [`bill_fragment`] in the full page shell, for `GET /b/{id}`'s
 /// initial render (as opposed to a bare polling/toggle fragment response).
-pub fn participant_page(bill_id: &str, state: &BillState, me: Option<&str>) -> ParticipantViewTemplate {
+pub fn participant_page(
+    bill_id: &str,
+    state: &BillState,
+    me: Option<&str>,
+    currency: Currency,
+) -> ParticipantViewTemplate {
     let heading = if state.status == "closed" {
         "Bill closed — final totals".to_string()
     } else {
         "Your bill".to_string()
     };
-    let fragment_html = render(bill_fragment(bill_id, state, me)).0;
+    let fragment_html = render(bill_fragment(bill_id, state, me, currency)).0;
     ParticipantViewTemplate {
         heading,
         fragment_html,

@@ -3,8 +3,9 @@ use std::sync::Arc;
 use tower_http::services::ServeDir;
 
 use sharepay::cleanup;
+use sharepay::config::{AppConfig, OcrEngineKind};
 use sharepay::db::{self, DbConfig};
-use sharepay::receipt::TesseractEngine;
+use sharepay::receipt::{ClaudeReceiptEngine, ReceiptEngine, TesseractReceiptEngine};
 use sharepay::routes::{router, AppState};
 
 /// Environment variable naming the public base URL used to build join
@@ -40,6 +41,12 @@ const TESSDATA_PREFIX_ENV_VAR: &str = "SHAREPAY_TESSDATA_PREFIX";
 /// was added.
 const OCR_LANGUAGE: &str = "rus+kaz+eng";
 
+/// Env var carrying the Anthropic API key, read only when
+/// `ocr_engine = "claude"` in the config file (see [`sharepay::config`]) —
+/// an API key never lives in the config file itself, following the
+/// existing `SHAREPAY_*` env-var convention used above.
+const ANTHROPIC_API_KEY_ENV_VAR: &str = "SHAREPAY_ANTHROPIC_API_KEY";
+
 #[tokio::main]
 async fn main() {
     let config = DbConfig::from_env();
@@ -55,19 +62,45 @@ async fn main() {
     let base_url =
         std::env::var(BASE_URL_ENV_VAR).unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
 
-    let tessdata_prefix = std::env::var(TESSDATA_PREFIX_ENV_VAR).ok();
-    let ocr_engine: Arc<dyn sharepay::receipt::OcrEngine> = Arc::new(
-        TesseractEngine::new(tessdata_prefix.as_deref(), OCR_LANGUAGE)
-            .expect(
-                "failed to initialize the Tesseract OCR engine — verify libtesseract/liblept \
-                 and eng.traineddata are installed, or set SHAREPAY_TESSDATA_PREFIX",
-            ),
+    let app_config = AppConfig::load().expect(
+        "failed to parse sharepay.toml — check its syntax, or set SHAREPAY_CONFIG_PATH \
+         to a valid file (a missing file is fine and uses defaults)",
     );
+
+    let receipt_engine: Arc<dyn ReceiptEngine> = match app_config.ocr_engine {
+        OcrEngineKind::Tesseract => {
+            let tessdata_prefix = std::env::var(TESSDATA_PREFIX_ENV_VAR).ok();
+            Arc::new(
+                TesseractReceiptEngine::new(tessdata_prefix.as_deref(), OCR_LANGUAGE).expect(
+                    "failed to initialize the Tesseract OCR engine — verify libtesseract/liblept \
+                     and eng.traineddata are installed, or set SHAREPAY_TESSDATA_PREFIX",
+                ),
+            )
+        }
+        OcrEngineKind::Claude => {
+            let api_key = std::env::var(ANTHROPIC_API_KEY_ENV_VAR).expect(
+                "ocr_engine = \"claude\" in sharepay.toml requires SHAREPAY_ANTHROPIC_API_KEY \
+                 to be set",
+            );
+            // `reqwest::blocking::Client` builds its own internal Tokio
+            // runtime, which panics if constructed directly from within an
+            // already-running one (here, `#[tokio::main]`'s) — construct it
+            // on a `spawn_blocking` thread instead, same as every other
+            // blocking call in this codebase.
+            Arc::new(
+                tokio::task::spawn_blocking(move || ClaudeReceiptEngine::new(api_key))
+                    .await
+                    .expect("Claude receipt engine construction task panicked")
+                    .expect("failed to initialize the Claude receipt engine"),
+            )
+        }
+    };
 
     let state = AppState {
         pool,
         base_url,
-        ocr_engine,
+        receipt_engine,
+        currency: app_config.currency,
     };
 
     let app = router(state).nest_service("/static", ServeDir::new("static"));

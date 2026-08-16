@@ -17,7 +17,7 @@ use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
 use sharepay::db::{init_pool, DbConfig};
 use sharepay::pricing::api::{add_items, NewItem};
-use sharepay::receipt::TesseractEngine;
+use sharepay::receipt::TesseractReceiptEngine;
 use sharepay::routes::{router, AppState};
 use sharepay::{bill, pricing};
 use tower::ServiceExt;
@@ -30,12 +30,16 @@ async fn test_app() -> (axum::Router, sqlx::SqlitePool) {
     // doesn't exercise `POST /b/{id}/photo` itself (that's covered in
     // `tests/receipt_photo.rs`), so the engine is constructed but never
     // called here.
-    let ocr_engine: Arc<dyn sharepay::receipt::OcrEngine> =
-        Arc::new(TesseractEngine::new(None, "eng").expect("Tesseract engine should initialize"));
+    let receipt_engine: Arc<dyn sharepay::receipt::ReceiptEngine> =
+        Arc::new(TesseractReceiptEngine::new(None, "eng").expect("Tesseract engine should initialize"));
     let state = AppState {
         pool: pool.clone(),
         base_url: "https://sharepay.example".to_string(),
-        ocr_engine,
+        receipt_engine,
+        // USD here is just this test file's fixture currency (unrelated to
+        // what's under test) — kept so existing "$X.XX" assertions below
+        // stay valid.
+        currency: sharepay::config::Currency::Usd,
     };
     (router(state), pool)
 }
@@ -424,6 +428,23 @@ async fn full_bill_lifecycle_over_http() {
     let body = body_text(resp).await;
     assert!(body.contains("Your total: <strong>$0.00</strong>"));
 
+    // Re-mark it so the bill is fully claimed before closing — closing
+    // while anything is unmarked is covered by its own dedicated test,
+    // `close_is_blocked_until_every_item_is_marked` below.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/items/{item_id}/mark"))
+                .header(axum::http::header::COOKIE, &participant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
     // 11. POST /b/{id}/close, host-gated, then closed-summary view for the
     //     participant.
     let resp = app
@@ -659,4 +680,184 @@ async fn landing_page_renders() {
     let body = body_text(resp).await;
     assert!(body.contains("SharePay"));
     assert!(body.contains("Start a new bill"));
+}
+
+/// Verifies the host cannot close a bill while any item still has zero
+/// markers — closing is blocked outright (409 Conflict), not merely
+/// nagged about, per an explicit product decision that overrides the
+/// original spec §3.3.1 "nag but never block" design (see
+/// `pricing::error::PriceDistributorError::UnclaimedItemsRemain`'s doc
+/// comment). One host, one participant. Items are seeded directly (no
+/// OCR involved), the same way `full_bill_lifecycle_over_http` bridges
+/// the OCR gap.
+#[tokio::test]
+async fn close_is_blocked_until_every_item_is_marked() {
+    let (app, pool) = test_app().await;
+
+    // Host creates the bill.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/bills")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let host_cookie = all_set_cookies(&resp).remove(0);
+    let bill_id = bill_id_from_location(&resp);
+
+    // Bridge the OCR gap: two generated items, forced straight to
+    // pending_confirmation.
+    let item_ids = add_items(
+        &pool,
+        &bill_id,
+        vec![
+            NewItem {
+                name: "Burger".into(),
+                price_cents: 1200,
+            },
+            NewItem {
+                name: "Fries".into(),
+                price_cents: 500,
+            },
+        ],
+    )
+    .await
+    .unwrap();
+    let (burger_id, fries_id) = (item_ids[0], item_ids[1]);
+    bill::force_status(&pool, &bill_id, "pending_confirmation")
+        .await
+        .unwrap();
+
+    // Confirm -> open.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/confirm"))
+                .header(axum::http::header::COOKIE, &host_cookie)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // One participant joins.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/join"))
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(Body::from("display_name=Alice"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let participant_cookie = all_set_cookies(&resp).remove(0);
+
+    // Host tries to close before anything is marked -> blocked, bill
+    // stays open.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/close"))
+                .header(axum::http::header::COOKIE, &host_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let body = body_text(resp).await;
+    assert!(body.contains("unclaimed"));
+    assert_eq!(
+        bill::get_status(&pool, &bill_id).await.unwrap().as_deref(),
+        Some("open"),
+        "a blocked close must not transition the bill"
+    );
+
+    // Alice marks only the Burger — Fries is still unclaimed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/items/{burger_id}/mark"))
+                .header(axum::http::header::COOKIE, &participant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Still blocked — Fries is unmarked.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/close"))
+                .header(axum::http::header::COOKIE, &host_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        bill::get_status(&pool, &bill_id).await.unwrap().as_deref(),
+        Some("open")
+    );
+
+    // Alice marks Fries too — everything is now claimed.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/items/{fries_id}/mark"))
+                .header(axum::http::header::COOKIE, &participant_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Now closing succeeds.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/b/{bill_id}/close"))
+                .header(axum::http::header::COOKIE, &host_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        bill::get_status(&pool, &bill_id).await.unwrap().as_deref(),
+        Some("closed")
+    );
 }

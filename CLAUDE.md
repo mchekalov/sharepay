@@ -37,6 +37,19 @@ Config is via environment variables, all optional with sane local-dev defaults (
 - `SHAREPAY_DB_PATH` — SQLite file path (default `sharepay.db` in the working directory; migrations in `migrations/` run automatically on startup).
 - `SHAREPAY_BASE_URL` — public base URL used to build join links/QR payloads (default `http://localhost:3000`; **must** be set to the real HTTPS domain in production — join-link/QR generation and the `Secure` cookie flag both assume HTTPS).
 - `SHAREPAY_TESSDATA_PREFIX` — override for where `<lang>.traineddata` files live; unset works on this dev machine (resolves to `/opt/homebrew/share/tessdata`), needed on deployment targets where Tesseract's own auto-resolution doesn't land correctly.
+- `SHAREPAY_ANTHROPIC_API_KEY` — Anthropic API key, required only when `ocr_engine = "claude"` (see below); the server fails fast at startup if it's missing in that case.
+
+### Config file
+
+A TOML config file, read once at startup (`src/config.rs`), holds settings that aren't secrets and don't need an env var's ambient-global feel. Two fields:
+
+```toml
+# sharepay.toml
+ocr_engine = "tesseract"   # or "claude"
+currency = "kzt"           # or "usd"
+```
+
+Path defaults to `sharepay.toml` in the working directory, overridable via `SHAREPAY_CONFIG_PATH`. A missing file is fine (defaults to `ocr_engine = "tesseract"`, `currency = "kzt"`); a malformed file fails startup fast, same as the `.expect(...)` patterns elsewhere in `main.rs`. `ocr_engine = "claude"` calls the Anthropic API instead of running OCR locally — see "Receipt Recognizer" below — and requires `SHAREPAY_ANTHROPIC_API_KEY`. `currency` selects which symbol `templates::fmt_cents` formats money with (`$12.34` for `usd`, `12.34 ₸` for `kzt`) — defaults to tenge since that's this app's actual target market (see `OCR_LANGUAGE` below), not USD.
 
 ### Debugging the OCR pipeline directly
 
@@ -60,6 +73,8 @@ SQLite schema: `bills`, `items`, `participants`, `item_markers` (many-to-many: w
 
 Item mutations are only valid while a bill is in a pre-open status (`PRE_OPEN_STATUSES`); this is enforced both here and via SQLite triggers in the migration (defense in depth).
 
+`close_bill` blocks (`Err(UnclaimedItemsRemain)`, surfaced as `409 Conflict`) while any item still has zero markers — a later product decision that overrides the original spec §3.3.1 "nag but never block" design (the spec's UI was meant to warn about unclaimed items while still letting the host close anyway).
+
 ### 2. QR/Session Management (`src/bill/`, `src/host_auth.rs`, `src/qr.rs`, `src/cleanup.rs`, most of `src/routes/bill.rs`)
 
 Owns the bill lifecycle state machine: `draft → pending_ocr ⇄ awaiting_photo_retry → pending_confirmation → open → closed`, plus `expired` for abandoned pre-open bills (`src/bill/mod.rs`). Each real transition is a named, single-purpose function (`mark_pending_ocr`, `mark_awaiting_photo_retry`, `mark_pending_confirmation`, plus `pricing::api::open_bill`/`close_bill`) — no route accepts an arbitrary target status. `bill::force_status` is a **test-harness-only** escape hatch to jump a bill into a given state without running the real OCR pipeline; never call it from production code paths.
@@ -70,12 +85,18 @@ Two independent 128-bit tokens gate access, deliberately kept separate: the `bil
 
 ### 3. Receipt Recognizer (`src/receipt/`, `src/routes/receipt.rs`)
 
-`POST /b/{id}/photo` runs synchronously (not the async-job pattern the original spec considered — local OCR latency proved fast enough not to need it) through four stages, each its own module:
+`POST /b/{id}/photo` runs synchronously (not the async-job pattern the original spec considered — local OCR latency proved fast enough not to need it). The pluggable unit is `ReceiptEngine` (`receipt_engine.rs`): `fn recognize_receipt(&self, image_bytes: &[u8]) -> Result<RecognizedReceipt, OcrError>`, a blocking call (run via `spawn_blocking`) returning a fully-parsed receipt (items + subtotal/tax/total). `AppState.receipt_engine: Arc<dyn ReceiptEngine>` is selected once at startup in `main.rs` by the config file's `ocr_engine` value (see "Config file" above) — `src/routes/receipt.rs`'s pipeline doesn't know or care which implementation it's talking to. Two implementations exist:
 
-1. `preprocess.rs` — decode/validate, orientation correction (tries EXIF first, then falls back to Tesseract's own OSD orientation detection via shelling out to `tesseract --psm 0`, since `leptess` exposes no OSD API — many real phone photos have no usable EXIF orientation tag), downscale, grayscale, contrast normalization, Otsu binarization.
-2. `ocr_engine.rs` — the `OcrEngine` trait + `TesseractEngine` (via `leptess`), isolated behind a trait specifically so the OCR backend stays swappable later (e.g. to a pure-Rust engine for a truly self-contained binary) without touching parsing logic. OCR language is `rus+kaz+eng` (see `main.rs`'s `OCR_LANGUAGE` doc comment for why — real Kazakhstani receipts are bilingual Cyrillic). `recognize_words` is blocking/CPU-bound; callers must run it via `spawn_blocking`.
-3. `parser.rs` — reconstructs lines from Tesseract's word-level TSV-equivalent output, classifies each line (item/subtotal/tax/tip/total/discount/noise/value-label) via parallel English and Cyrillic keyword sets, extracts prices with locale-aware number parsing (handles both `1,234.56` and `1 234,56` formats), and identifies the total line. Also implements a backward-resolving heuristic that merges multi-line item layouts (name line → quantity×price line → separate value-label line) common on real retail receipts.
-4. `reconcile.rs` — validates parsed item sum against the recognized total/subtotal within tolerance, in integer cents; a hard mismatch routes the bill to `awaiting_photo_retry` rather than ever silently accepting a broken parse.
+- **`TesseractReceiptEngine`** (`ocr_engine = "tesseract"`, the default) — runs the original local four-stage pipeline, each its own module:
+  1. `preprocess.rs` — decode/validate, orientation correction (tries EXIF first, then falls back to Tesseract's own OSD orientation detection via shelling out to `tesseract --psm 0`, since `leptess` exposes no OSD API — many real phone photos have no usable EXIF orientation tag), downscale, grayscale, contrast normalization, Otsu binarization.
+  2. `ocr_engine.rs` — the low-level `OcrEngine` trait + `TesseractEngine` (via `leptess`), producing word-level text/confidence/layout. OCR language is `rus+kaz+eng` (see `main.rs`'s `OCR_LANGUAGE` doc comment for why — real Kazakhstani receipts are bilingual Cyrillic). `recognize_words` is blocking/CPU-bound.
+  3. `parser.rs` — reconstructs lines from Tesseract's word-level TSV-equivalent output, classifies each line (item/subtotal/tax/tip/total/discount/noise/value-label) via parallel English and Cyrillic keyword sets, extracts prices with locale-aware number parsing (handles both `1,234.56` and `1 234,56` formats), and identifies the total line. Also implements a backward-resolving heuristic that merges multi-line item layouts (name line → quantity×price line → separate value-label line) common on real retail receipts.
+  `TesseractReceiptEngine::recognize_receipt` is the only place stages 2-3 are wired together; it's a thin adapter reproducing the shape `reconcile.rs` (below) expects.
+- **`ClaudeReceiptEngine`** (`ocr_engine = "claude"`, `claude_engine.rs`) — calls the Anthropic Messages API (Claude Sonnet 5, model id hardcoded — started on Haiku 4.5, upgraded after local testing showed Haiku unreliably distinguishing subtotal from total on dense small-text Cyrillic receipts) with the receipt photo as a vision input, using forced tool-use to get structured items/subtotal/tax/total back directly as JSON. Skips `ocr_engine.rs`/`parser.rs` entirely — those heuristics only make sense for Tesseract's raw per-word output, not a model that reads the receipt itself. Requires `SHAREPAY_ANTHROPIC_API_KEY`; each item's `confidence` is always `None` (Claude has no per-word OCR-confidence analog).
+
+Either way, **`reconcile.rs`** is shared and fully engine-agnostic: it validates the parsed item sum against the recognized total/subtotal within tolerance, in integer cents; a hard mismatch routes the bill to `awaiting_photo_retry` rather than ever silently accepting a broken parse.
+
+Known limitation: `tokio::time::timeout` (the `OCR_TIMEOUT` budget in `routes/receipt.rs`) doesn't abort the underlying `spawn_blocking` thread when it fires — a wedged call keeps running on the blocking threadpool regardless of the timeout. Pre-existing for the Tesseract path; `ClaudeReceiptEngine` additionally bounds itself with its own 15s HTTP client timeout, which the Tesseract path has no equivalent of.
 
 ### 4. Mobile Web Client (`src/templates.rs`, `templates/*.html`, `static/`, response-rendering in `src/routes/bill.rs` and `src/routes/receipt.rs`)
 

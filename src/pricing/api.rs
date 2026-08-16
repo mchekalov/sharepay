@@ -425,7 +425,10 @@ pub async fn unmark_item(
 }
 
 /// `open -> closed`. Sets `closed_at`. Idempotent: calling this on an
-/// already-`closed` bill is a no-op success.
+/// already-`closed` bill is a no-op success. Blocked (returns
+/// `Err(UnclaimedItemsRemain)`) while any item still has zero markers —
+/// see that variant's doc comment for why this overrides the original
+/// spec's "nag but never block" design.
 pub async fn close_bill(pool: &SqlitePool, bill_id: &str) -> Result<(), Error> {
     let status: Option<String> = sqlx::query_scalar("SELECT status FROM bills WHERE id = ?")
         .bind(bill_id)
@@ -435,6 +438,21 @@ pub async fn close_bill(pool: &SqlitePool, bill_id: &str) -> Result<(), Error> {
 
     match status.as_str() {
         "open" => {
+            let unassigned_amount_cents: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(i.price), 0) FROM items i
+                 WHERE i.bill_id = ? AND NOT EXISTS (
+                     SELECT 1 FROM item_markers m WHERE m.item_id = i.id
+                 )",
+            )
+            .bind(bill_id)
+            .fetch_one(pool)
+            .await?;
+            if unassigned_amount_cents > 0 {
+                return Err(Error::UnclaimedItemsRemain {
+                    unassigned_amount_cents,
+                });
+            }
+
             sqlx::query(
                 "UPDATE bills SET status = 'closed', closed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                  WHERE id = ?",
@@ -671,7 +689,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(item_ids.len(), 3);
-        let (burger_id, fries_id, _salad_id) = (item_ids[0], item_ids[1], item_ids[2]);
+        let (burger_id, fries_id, salad_id) = (item_ids[0], item_ids[1], item_ids[2]);
 
         // tax_tip_amount is set directly for this test (in the real system
         // it's set by the Receipt Recognizer / QR-Session confirm step).
@@ -754,6 +772,17 @@ mod tests {
         assert_eq!(state2.my_total, 0, "no requesting participant this time");
         let burger_view2 = state2.items.iter().find(|i| i.id == burger_id).unwrap();
         assert_eq!(burger_view2.markers.len(), 2);
+
+        // Closing is blocked while Salad is still unclaimed.
+        let blocked = close_bill(&pool, &bill_id).await;
+        assert!(matches!(
+            blocked,
+            Err(PriceDistributorError::UnclaimedItemsRemain {
+                unassigned_amount_cents: 900
+            })
+        ));
+
+        mark_item(&pool, &bill_id, salad_id, &carol).await.unwrap();
 
         close_bill(&pool, &bill_id).await.unwrap();
         // Idempotent double-close.

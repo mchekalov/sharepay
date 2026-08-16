@@ -43,6 +43,14 @@ pub enum PriceDistributorError {
     #[error("bill id already exists")]
     IdCollision,
 
+    /// `close_bill` was called while one or more items still have zero
+    /// markers. Deliberately overrides spec §3.3.1's original "nag but
+    /// never block" design (the UI was meant to warn about unclaimed items
+    /// while still letting the host close anyway) per an explicit later
+    /// product decision to block closing outright instead.
+    #[error("bill has {unassigned_amount_cents} cents of unclaimed items remaining")]
+    UnclaimedItemsRemain { unassigned_amount_cents: i64 },
+
     /// Underlying database error that doesn't map to one of the above
     /// well-known conditions.
     #[error("database error: {0}")]

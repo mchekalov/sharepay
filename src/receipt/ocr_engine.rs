@@ -40,6 +40,16 @@ pub enum OcrError {
     ImageLoad(String),
     #[error("OCR engine produced invalid UTF-8 output: {0}")]
     InvalidOutput(String),
+    /// No text/receipt content was recognized at all — e.g. Tesseract
+    /// returned zero words. See
+    /// [`crate::receipt::receipt_engine::TesseractReceiptEngine`].
+    #[error("no text was detected in the image")]
+    NoTextDetected,
+    /// Network/HTTP-layer failure from an API-based engine (e.g.
+    /// [`crate::receipt::claude_engine::ClaudeReceiptEngine`]) — connection
+    /// error, non-2xx status, timeout.
+    #[error("OCR request failed: {0}")]
+    RequestFailed(String),
 }
 
 /// Abstraction over an OCR backend (spec §1.1). Takes already-preprocessed

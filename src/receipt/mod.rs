@@ -16,14 +16,28 @@
 //!    success-with-confidence-flag outcome, all in integer cents (spec
 //!    §1.4).
 //!
+//! [`receipt_engine`] sits above stages 2-3: [`ReceiptEngine`] is the
+//! pluggable interface `src/main.rs`/`AppState` actually use, returning a
+//! fully-parsed receipt directly rather than word-level OCR output.
+//! [`receipt_engine::TesseractReceiptEngine`] runs the full stage 2→3
+//! pipeline above internally; [`claude_engine::ClaudeReceiptEngine`] calls
+//! the Anthropic API instead, skipping `ocr_engine`/`parser` entirely
+//! (Claude reads the receipt directly). [`reconcile`] (stage 4) is shared,
+//! engine-agnostic either way — selected at startup via
+//! `config::AppConfig::ocr_engine`.
+//!
 //! `src/routes/receipt.rs` (owned by this component too) is the HTTP layer
 //! that wires this pipeline into the bill state machine the QR/Session
 //! component built (`pending_ocr` ⇄ `awaiting_photo_retry` →
 //! `pending_confirmation`).
 
+pub mod claude_engine;
 pub mod ocr_engine;
 pub mod parser;
 pub mod preprocess;
+pub mod receipt_engine;
 pub mod reconcile;
 
+pub use claude_engine::ClaudeReceiptEngine;
 pub use ocr_engine::{OcrEngine, OcrError, OcrWord, TesseractEngine};
+pub use receipt_engine::{ReceiptEngine, RecognizedItem, RecognizedReceipt, TesseractReceiptEngine};

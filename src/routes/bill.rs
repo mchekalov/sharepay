@@ -22,11 +22,12 @@ use serde::Deserialize;
 use sqlx::SqlitePool;
 
 use crate::bill::{self, token::generate_token, token::hash_token};
+use crate::config::Currency;
 use crate::host_auth::{self, HostAuthError};
 use crate::pricing::api::{self as pricing_api, PRE_OPEN_STATUSES};
 use crate::pricing::PriceDistributorError;
 use crate::qr;
-use crate::receipt::OcrEngine;
+use crate::receipt::ReceiptEngine;
 use crate::templates::{
     self, render, ErrorTemplate, HostQrTemplate, HostUploadTemplate, JoinedFragmentTemplate,
     LandingTemplate, NameEntryTemplate, NotReadyTemplate,
@@ -40,13 +41,17 @@ pub struct AppState {
     /// `https://sharepay.example`. No trailing slash required (stripped in
     /// [`qr::join_url`] if present).
     pub base_url: String,
-    /// The OCR backend used by `POST /b/{id}/photo` (`src/routes/receipt.rs`).
-    /// `Arc<dyn OcrEngine>` rather than a concrete type so the Tesseract
-    /// implementation stays swappable (spec §1.1) and so the one
-    /// long-lived engine instance (expensive to construct — loads
-    /// trained-data from disk) is cheaply cloned across requests via
-    /// `AppState::clone()`.
-    pub ocr_engine: Arc<dyn OcrEngine>,
+    /// The receipt-recognition backend used by `POST /b/{id}/photo`
+    /// (`src/routes/receipt.rs`). `Arc<dyn ReceiptEngine>` rather than a
+    /// concrete type so the backend stays swappable (Tesseract vs. Claude,
+    /// selected at startup by `config::AppConfig::ocr_engine`) and so the
+    /// one long-lived engine instance (expensive to construct — loads
+    /// trained-data from disk, or holds an HTTP client) is cheaply cloned
+    /// across requests via `AppState::clone()`.
+    pub receipt_engine: Arc<dyn ReceiptEngine>,
+    /// Currency `src/templates.rs::fmt_cents` formats money in, selected at
+    /// startup by `config::AppConfig::currency`.
+    pub currency: Currency,
 }
 
 // ---------------------------------------------------------------------
@@ -90,6 +95,14 @@ impl From<PriceDistributorError> for AppError {
                 AppError::BadRequest("invalid display name".into())
             }
             PriceDistributorError::IdCollision => AppError::Internal("id collision".into()),
+            // Currency-agnostic fallback: the one call site that actually
+            // produces this (`close_bill_handler`) intercepts it before
+            // the `?`-driven `From` conversion runs, so it can format the
+            // amount with `state.currency` (unavailable here — this `From`
+            // impl has no `AppState` access).
+            PriceDistributorError::UnclaimedItemsRemain { .. } => AppError::Conflict(
+                "some items are still unclaimed — ask everyone to mark what they ordered before closing.".into(),
+            ),
             PriceDistributorError::Database(e) => AppError::from_db(e),
         }
     }
@@ -228,12 +241,12 @@ pub async fn host_view(
         .into_response()),
         "pending_confirmation" => {
             let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
-            Ok(render(templates::host_review_page(&bill_id, &bill_state)).into_response())
+            Ok(render(templates::host_review_page(&bill_id, &bill_state, state.currency)).into_response())
         }
         "open" => Ok(render(host_qr_template(&state, &bill_id).await?).into_response()),
         "closed" => {
             let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
-            Ok(render(templates::participant_page(&bill_id, &bill_state, None)).into_response())
+            Ok(render(templates::participant_page(&bill_id, &bill_state, None, state.currency)).into_response())
         }
         other => Err(AppError::Internal(format!("unexpected bill status {other:?}"))),
     }
@@ -309,7 +322,7 @@ pub async fn add_item_handler(
     let item_id = ids[0];
     let row_html = templates::review_row(&bill_id, item_id, "", 0);
     let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
-    let footer_html = templates::totals_footer(&bill_state, true);
+    let footer_html = templates::totals_footer(&bill_state, true, state.currency);
     Ok(Html(format!("{row_html}{footer_html}")))
 }
 
@@ -325,7 +338,7 @@ pub async fn delete_item_handler(
     require_host(&state.pool, &jar, &bill_id).await?;
     pricing_api::delete_item(&state.pool, &bill_id, item_id).await?;
     let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
-    Ok(Html(templates::totals_footer(&bill_state, true)))
+    Ok(Html(templates::totals_footer(&bill_state, true, state.currency)))
 }
 
 /// `POST /b/{id}/confirm` — host-gated, idempotent on an already-`open`
@@ -395,9 +408,20 @@ pub async fn close_bill_handler(
     jar: CookieJar,
 ) -> Result<impl IntoResponse, AppError> {
     require_host(&state.pool, &jar, &bill_id).await?;
-    pricing_api::close_bill(&state.pool, &bill_id).await?;
+    match pricing_api::close_bill(&state.pool, &bill_id).await {
+        Ok(()) => {}
+        Err(PriceDistributorError::UnclaimedItemsRemain {
+            unassigned_amount_cents,
+        }) => {
+            return Err(AppError::Conflict(format!(
+                "{} of items are still unclaimed — ask everyone to mark what they ordered before closing.",
+                templates::fmt_cents(unassigned_amount_cents, state.currency)
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    }
     let bill_state = pricing_api::get_bill_state(&state.pool, &bill_id, None).await?;
-    Ok(render(templates::participant_page(&bill_id, &bill_state, None)))
+    Ok(render(templates::participant_page(&bill_id, &bill_state, None, state.currency)))
 }
 
 /// `GET /b/{id}/qr.svg` — QR code for the join URL. Only served once
@@ -447,6 +471,7 @@ pub async fn bill_entry(
             &bill_id,
             &bill_state,
             participant_id.as_deref(),
+            state.currency,
         ))
         .into_response());
     }
@@ -460,8 +485,10 @@ pub async fn bill_entry(
         Some(participant_id) => {
             let bill_state =
                 pricing_api::get_bill_state(&state.pool, &bill_id, Some(&participant_id)).await?;
-            Ok(render(templates::participant_page(&bill_id, &bill_state, Some(&participant_id)))
-                .into_response())
+            Ok(
+                render(templates::participant_page(&bill_id, &bill_state, Some(&participant_id), state.currency))
+                    .into_response(),
+            )
         }
         None => Ok(render(NameEntryTemplate {
             bill_id,
@@ -533,6 +560,7 @@ pub async fn fragment_handler(
         &bill_id,
         &bill_state,
         participant_id.as_deref(),
+        state.currency,
     )))
 }
 
@@ -553,6 +581,7 @@ pub async fn mark_item_handler(
         &bill_id,
         &bill_state,
         Some(&participant_id),
+        state.currency,
     )))
 }
 
@@ -571,6 +600,7 @@ pub async fn unmark_item_handler(
         &bill_id,
         &bill_state,
         Some(&participant_id),
+        state.currency,
     )))
 }
 

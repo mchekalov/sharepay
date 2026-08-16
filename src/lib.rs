@@ -7,6 +7,7 @@
 
 pub mod bill;
 pub mod cleanup;
+pub mod config;
 pub mod db;
 pub mod host_auth;
 pub mod pricing;
