@@ -1,12 +1,15 @@
 {% extends "shell.html" %}
 {% block content %}
+{% if is_open %}
 <h1>Ready! Show this to your friends</h1>
 <div class="qr-wrap">{{ qr_svg|safe }}</div>
 <p class="join-link"><span class="link-text">{{ join_url }}</span> <button type="button" class="copy-btn btn-secondary" data-copy-text="{{ join_url }}">📋 Copy link</button></p>
 <p>Ask everyone to scan this and mark what they ordered.</p>
 <div id="joined-fragment" hx-get="/b/{{ bill_id }}/joined-fragment" hx-trigger="every 4s" hx-target="#joined-fragment" hx-swap="innerHTML">{{ joined_html|safe }}</div>
-<p><a href="/b/{{ bill_id }}">View bill as it fills in →</a></p>
-<form method="post" action="/b/{{ bill_id }}/close" onsubmit="return confirm('Close the bill for everyone?');">
-  <button type="submit" class="btn-secondary">Close bill</button>
-</form>
+{% else %}
+<h1>Bill closed — final totals</h1>
+<p class="closed-banner">This bill is closed.</p>
+{% endif %}
+
+{{ items_html|safe }}
 {% endblock %}

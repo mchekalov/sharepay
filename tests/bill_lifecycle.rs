@@ -785,7 +785,11 @@ async fn close_is_blocked_until_every_item_is_marked() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    // A blocked close is a legitimate expected UI state, not an HTTP
+    // error: 200 OK, re-rendering the same host page (still open) with an
+    // inline "unclaimed" message appended, rather than a separate error
+    // page.
+    assert_eq!(resp.status(), StatusCode::OK);
     let body = body_text(resp).await;
     assert!(body.contains("unclaimed"));
     assert_eq!(
@@ -822,7 +826,7 @@ async fn close_is_blocked_until_every_item_is_marked() {
         )
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         bill::get_status(&pool, &bill_id).await.unwrap().as_deref(),
         Some("open")

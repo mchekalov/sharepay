@@ -1,0 +1,42 @@
+<div id="host-items"{% if is_open %} hx-get="/b/{{ bill_id }}/host-fragment" hx-trigger="every 4s" hx-target="#host-items" hx-swap="outerHTML"{% endif %}>
+  <div class="item-list">
+    {% for item in items %}
+    <div class="item-row"
+         {% if interactive %}
+         role="checkbox" aria-checked="{{ item.is_marked_by_me }}" tabindex="0"
+         hx-{% if item.is_marked_by_me %}delete{% else %}post{% endif %}="/b/{{ bill_id }}/items/{{ item.id }}/mark" hx-target="#host-items" hx-swap="outerHTML"
+         {% else %}
+         style="cursor:default;"
+         {% endif %}>
+      <span class="checkbox">{% if item.marked %}✅{% else %}☐{% endif %}</span>
+      <span class="item-name">{{ item.name }}</span>
+      <span class="item-price">{{ item.price_display }}</span>
+      <span class="markers">{{ item.markers_display }}</span>
+    </div>
+    {% endfor %}
+  </div>
+  {% if let Some(unassigned) = unassigned_display %}
+  <p class="unassigned-note">⚠️ Unclaimed items: {{ unassigned }} — ask around!</p>
+  {% endif %}
+  <p id="totals-footer">Items subtotal: {{ items_subtotal_display }} &nbsp; Tax &amp; tip: {{ tax_tip_display }} &nbsp; Receipt total: {{ receipt_total_display }}</p>
+  {% if let Some(my_total) = my_total_display %}
+  <p class="your-total">Your total: <strong>{{ my_total }}</strong></p>
+  {% endif %}
+  {% if show_join_prompt %}
+  <form hx-post="/b/{{ bill_id }}/host-join" hx-target="#host-items" hx-swap="outerHTML">
+    <input type="text" id="host-join-name" name="display_name" placeholder="Your name" value="{{ join_name_value }}" required hx-preserve="true">
+    <button type="submit" class="btn-secondary">🍽️ I'm eating too — mark my dishes</button>
+  </form>
+  {% if let Some(err) = join_error %}
+  <p class="unassigned-note">{{ err }}</p>
+  {% endif %}
+  {% endif %}
+  {% if is_open %}
+  <form hx-post="/b/{{ bill_id }}/close" hx-target="body" hx-swap="outerHTML" onsubmit="return confirm('Close the bill for everyone?');">
+    <button type="submit" class="btn-secondary">Close bill</button>
+  </form>
+  {% if let Some(err) = close_error %}
+  <p class="unassigned-note">{{ err }}</p>
+  {% endif %}
+  {% endif %}
+</div>

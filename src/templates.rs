@@ -142,13 +142,128 @@ pub struct JoinedFragmentTemplate {
     pub names: Vec<String>,
 }
 
+#[derive(Clone)]
+pub struct HostItemRow {
+    pub id: i64,
+    pub name: String,
+    pub price_display: String,
+    /// Whether *anyone* has marked this item (drives the ☐/✅ icon).
+    pub marked: bool,
+    pub markers_display: String,
+    /// The host's own mark state, once they've opted in via `/host-join`
+    /// (meaningless — always `false` — while `interactive` is `false`).
+    pub is_marked_by_me: bool,
+}
+
 #[derive(Template)]
-#[template(path = "host_qr.html")]
-pub struct HostQrTemplate {
+#[template(path = "host_items_fragment.html")]
+pub struct HostItemsFragmentTemplate {
     pub bill_id: String,
+    pub is_open: bool,
+    pub items: Vec<HostItemRow>,
+    pub unassigned_display: Option<String>,
+    pub items_subtotal_display: String,
+    pub tax_tip_display: String,
+    pub receipt_total_display: String,
+    /// `true` once the host has opted in as a participant (via
+    /// `/host-join`) *and* the bill is still open — rows become
+    /// clickable mark/unmark toggles, same as [`bill_fragment`]'s.
+    pub interactive: bool,
+    /// The host's own share, shown once they've opted in.
+    pub my_total_display: Option<String>,
+    /// `true` while open and the host hasn't opted in yet — shows the
+    /// inline "I'm eating too" name form.
+    pub show_join_prompt: bool,
+    pub join_error: Option<String>,
+    pub join_name_value: String,
+    /// `Some(msg)` only right after a blocked "Close bill" attempt on
+    /// *this* request. Lives inside this polled/mark-swapped fragment
+    /// (not the outer page shell) specifically so it's cleared the moment
+    /// the host marks/unmarks anything or the next poll ticks — every
+    /// other code path that re-renders this fragment always passes
+    /// `None`, so a stale blocked-close message can never survive a mark,
+    /// unmark, join, or poll.
+    pub close_error: Option<String>,
+}
+
+/// Builds the host's item-list + totals fragment (embedded in
+/// [`HostBillTemplate`] and served standalone by the `/host-fragment` poll
+/// endpoint). The host has no participant identity *by default* (spec
+/// §2), so this always shows the full read-only picture (every item's
+/// markers, overall totals) — but once `viewer_participant_id` is
+/// `Some(..)` (the host opted in via `POST /b/{id}/host-join`, spec: "I'm
+/// eating too"), rows also become clickable mark/unmark toggles scoped to
+/// that identity, same as [`bill_fragment`]'s. `state` must have been
+/// fetched with that same `viewer_participant_id` so `is_marked_by_me`/
+/// `my_total` are correctly populated.
+pub fn host_items_fragment(
+    bill_id: &str,
+    state: &BillState,
+    viewer_participant_id: Option<&str>,
+    currency: Currency,
+    join_error: Option<String>,
+    join_name_value: String,
+    close_error: Option<String>,
+) -> HostItemsFragmentTemplate {
+    let items: Vec<HostItemRow> = state
+        .items
+        .iter()
+        .map(|item| {
+            let names: Vec<String> = item.markers.iter().map(|m| m.display_name.clone()).collect();
+            HostItemRow {
+                id: item.id,
+                name: item.name.clone(),
+                price_display: fmt_cents(item.price_cents, currency),
+                marked: !names.is_empty(),
+                markers_display: names.join(", "),
+                is_marked_by_me: item.is_marked_by_me,
+            }
+        })
+        .collect();
+
+    let unassigned_display = if state.unassigned_amount > 0 {
+        Some(fmt_cents(state.unassigned_amount, currency))
+    } else {
+        None
+    };
+
+    let items_subtotal: i64 = state.items.iter().map(|i| i.price_cents).sum();
+    let receipt_total = state.receipt_total.unwrap_or(items_subtotal + state.tax_tip_amount);
+    let is_open = state.status == "open";
+    let has_joined = viewer_participant_id.is_some();
+
+    HostItemsFragmentTemplate {
+        bill_id: bill_id.to_string(),
+        is_open,
+        items,
+        unassigned_display,
+        items_subtotal_display: fmt_cents(items_subtotal, currency),
+        tax_tip_display: fmt_cents(state.tax_tip_amount, currency),
+        receipt_total_display: fmt_cents(receipt_total, currency),
+        interactive: is_open && has_joined,
+        my_total_display: has_joined.then(|| fmt_cents(state.my_total, currency)),
+        show_join_prompt: is_open && !has_joined,
+        join_error,
+        join_name_value,
+        close_error,
+    }
+}
+
+/// The host's single persistent page while `open`/`closed` — QR code, join
+/// link, live join count, and the live item list all in one screen (no
+/// separate "view the dish list" navigation). The "Close bill" button and
+/// its blocked-attempt inline message live inside `items_html`
+/// ([`HostItemsFragmentTemplate::close_error`]), not here — see that
+/// struct's doc comment for why.
+#[derive(Template)]
+#[template(path = "host_bill.html")]
+pub struct HostBillTemplate {
+    pub bill_id: String,
+    pub is_open: bool,
     pub join_url: String,
     pub qr_svg: String,
     pub joined_html: String,
+    pub items_html: String,
 }
 
 // ---------------------------------------------------------------------
@@ -203,30 +318,17 @@ pub struct ErrorTemplate {
 
 /// Builds the `#bill-fragment` partial (spec §4.4.2/§4.4.3) — the
 /// authoritative item-list + your-total, shared by the initial full-page
-/// render, the polling endpoint, and the mark/unmark responses.
-/// `requesting_participant_id` scopes "You" labeling and `is_marked_by_me`;
-/// pass `None` for the host's closed-bill view.
-pub fn bill_fragment(
-    bill_id: &str,
-    state: &BillState,
-    me: Option<&str>,
-    currency: Currency,
-) -> BillFragmentTemplate {
+/// render, the polling endpoint, and the mark/unmark responses. Marker
+/// names are always shown as their real `display_name`, including the
+/// viewer's own (deliberately not shortened to "You" — spec §4.4.2's
+/// original mockup did that, but real display names read better in a
+/// group of markers).
+pub fn bill_fragment(bill_id: &str, state: &BillState, currency: Currency) -> BillFragmentTemplate {
     let items: Vec<FragmentItemRow> = state
         .items
         .iter()
         .map(|item| {
-            let names: Vec<String> = item
-                .markers
-                .iter()
-                .map(|m| {
-                    if Some(m.participant_id.as_str()) == me {
-                        "You".to_string()
-                    } else {
-                        m.display_name.clone()
-                    }
-                })
-                .collect();
+            let names: Vec<String> = item.markers.iter().map(|m| m.display_name.clone()).collect();
             FragmentItemRow {
                 id: item.id,
                 name: item.name.clone(),
@@ -258,18 +360,13 @@ pub fn bill_fragment(
 
 /// Wraps [`bill_fragment`] in the full page shell, for `GET /b/{id}`'s
 /// initial render (as opposed to a bare polling/toggle fragment response).
-pub fn participant_page(
-    bill_id: &str,
-    state: &BillState,
-    me: Option<&str>,
-    currency: Currency,
-) -> ParticipantViewTemplate {
+pub fn participant_page(bill_id: &str, state: &BillState, currency: Currency) -> ParticipantViewTemplate {
     let heading = if state.status == "closed" {
         "Bill closed — final totals".to_string()
     } else {
         "Your bill".to_string()
     };
-    let fragment_html = render(bill_fragment(bill_id, state, me, currency)).0;
+    let fragment_html = render(bill_fragment(bill_id, state, currency)).0;
     ParticipantViewTemplate {
         heading,
         fragment_html,

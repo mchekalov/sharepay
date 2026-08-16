@@ -73,7 +73,7 @@ SQLite schema: `bills`, `items`, `participants`, `item_markers` (many-to-many: w
 
 Item mutations are only valid while a bill is in a pre-open status (`PRE_OPEN_STATUSES`); this is enforced both here and via SQLite triggers in the migration (defense in depth).
 
-`close_bill` blocks (`Err(UnclaimedItemsRemain)`, surfaced as `409 Conflict`) while any item still has zero markers — a later product decision that overrides the original spec §3.3.1 "nag but never block" design (the spec's UI was meant to warn about unclaimed items while still letting the host close anyway).
+`close_bill` blocks (`Err(UnclaimedItemsRemain)`) while any item still has zero markers — a later product decision that overrides the original spec §3.3.1 "nag but never block" design (the spec's UI was meant to warn about unclaimed items while still letting the host close anyway). `close_bill_handler` (`src/routes/bill.rs`) treats this as a legitimate expected UI state rather than an HTTP error: it re-renders the same host page (still `open`) with an inline message, `200 OK`, not a `409`.
 
 ### 2. QR/Session Management (`src/bill/`, `src/host_auth.rs`, `src/qr.rs`, `src/cleanup.rs`, most of `src/routes/bill.rs`)
 
@@ -101,6 +101,8 @@ Known limitation: `tokio::time::timeout` (the `OCR_TIMEOUT` budget in `routes/re
 ### 4. Mobile Web Client (`src/templates.rs`, `templates/*.html`, `static/`, response-rendering in `src/routes/bill.rs` and `src/routes/receipt.rs`)
 
 Server-rendered Askama templates + HTMX, no SPA framework. `src/templates.rs` holds template structs and view-model builders; money is always formatted there via `fmt_cents`/`cents_to_input_value`, never in template arithmetic. The participant bill view polls a fragment endpoint on an interval; the polling `hx-trigger` lives on the fragment's own root element so it's re-included (and the timer restarts) on every swap, avoiding poll/toggle flicker. The entire hand-written JS surface is two small snippets in `static/app.js` (file-input auto-submit, delegated clipboard-copy handler) — everything else interactive goes through HTMX.
+
+The host's `open`/`closed` view is a single persistent page (`templates/host_bill.html`, built by `host_bill_template` in `src/routes/bill.rs`) rather than separate screens requiring back-navigation: the QR code, join link, live join count, and live item list (`templates/host_items_fragment.html`, host-gated poll at `GET /b/{id}/host-fragment`) are all embedded together, and closing re-renders this same template in place (`is_open: false`) instead of routing to a distinct page. The host's item list is a read-only rendering distinct from the participant `bill_fragment` (no personal "your total"/mark-toggle context — the host has no participant identity), showing per-item markers and running totals instead. A blocked "Close bill" attempt (`PriceDistributorError::UnclaimedItemsRemain`) appends an inline message to the end of this same page (`200 OK`) rather than navigating to an error page — see the QR/Session Management section above.
 
 ### Request flow across components
 
