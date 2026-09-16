@@ -1,0 +1,11 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "group:all"],
+  "timezone": "UTC",
+  "schedule": ["before 4am"],
+  "prConcurrentLimit": 1,
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 4am"]
+  }
+}
