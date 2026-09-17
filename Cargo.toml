@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "macros"] }
+sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "macros"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
@@ -17,7 +17,7 @@ getrandom = "0.4.3"
 time = "0.3.55"
 leptess = "0.14"
 image = "0.25"
-imageproc = "0.25"
+imageproc = "0.27"
 kamadak-exif = "0.6"
 regex = "1"
 askama = "0.16.0"
