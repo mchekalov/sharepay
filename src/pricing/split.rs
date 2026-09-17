@@ -308,8 +308,9 @@ mod tests {
     fn invariant_holds_for_various_amounts_and_participant_counts() {
         // A handful of arbitrary combinations, checking the sum-exactness
         // invariant holds every time (not just the one worked example).
-        let cases: Vec<(Vec<(i64, i64, usize)>, i64)> = vec![
-            // (item_id, price_cents, marker_count), tax_tip_amount
+        type ItemSpec = (i64, i64, usize); // (item_id, price_cents, marker_count)
+        let cases: Vec<(Vec<ItemSpec>, i64)> = vec![
+            // (item specs), tax_tip_amount
             (vec![(1, 1000, 3), (2, 333, 7), (3, 1, 2)], 250),
             (vec![(1, 1, 1)], 0),
             (vec![(1, 0, 3)], 10),
